@@ -1,0 +1,134 @@
+version: '3.8'
+
+x-airflow-common:
+  &airflow-common
+  image: apache/airflow:2.8.1
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    # Project-specific env vars passed through from .env
+    FRAUD_DB_HOST: ${FRAUD_DB_HOST:-postgres}
+    FRAUD_DB_PORT: ${FRAUD_DB_PORT:-5432}
+    FRAUD_DB_NAME: ${FRAUD_DB_NAME:-fraud_claims}
+    FRAUD_DB_USER: ${FRAUD_DB_USER:-airflow}
+    FRAUD_DB_PASSWORD: ${FRAUD_DB_PASSWORD:-airflow}
+    DATA_RAW_PATH: ${DATA_RAW_PATH:-/opt/airflow/data/raw}
+    DATA_PARQUET_PATH: ${DATA_PARQUET_PATH:-/opt/airflow/data/parquet}
+    MODEL_PATH: ${MODEL_PATH:-/opt/airflow/models}
+    CONTAMINATION_RATE: ${CONTAMINATION_RATE:-0.05}
+    RISK_SCORE_THRESHOLD: ${RISK_SCORE_THRESHOLD:-75}
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-.}/scripts:/opt/airflow/scripts
+    - ${AIRFLOW_PROJ_DIR:-.}/ml:/opt/airflow/ml
+    - ${AIRFLOW_PROJ_DIR:-.}/sql:/opt/airflow/sql
+    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-.}/data:/opt/airflow/data
+    - ${AIRFLOW_PROJ_DIR:-.}/models:/opt/airflow/models
+    - airflow-plugins:/opt/airflow/plugins
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
+services:
+
+  # -----------------------------------------------------------------------
+  # PostgreSQL — single instance serves both Airflow metadata and the
+  # fraud_claims analytics database. In production these would be separate.
+  # -----------------------------------------------------------------------
+  postgres:
+    image: postgres:15
+    container_name: fraud_anomaly_postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+      POSTGRES_MULTIPLE_DATABASES: fraud_claims
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+      - ./docker/init-multiple-dbs.sh:/docker-entrypoint-initdb.d/init-multiple-dbs.sh
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  # -----------------------------------------------------------------------
+  # Airflow — webserver, scheduler, and init service
+  # -----------------------------------------------------------------------
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: fraud_anomaly_airflow_webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: fraud_anomaly_airflow_scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: fraud_anomaly_airflow_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /sources/logs /sources/dags /sources/plugins
+        chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins}
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+      _PIP_ADDITIONAL_REQUIREMENTS: >-
+        psycopg2-binary==2.9.9
+        pandas==2.1.4
+        pyarrow==14.0.2
+        scikit-learn==1.4.0
+        xgboost==2.0.3
+        shap==0.44.0
+        sqlalchemy==2.0.25
+    user: "0:0"
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}:/sources
+
+volumes:
+  postgres-db-volume:
+  airflow-plugins:
