@@ -1,0 +1,52 @@
+# ============================================================
+# fraud-anomaly-ai — .gitignore
+# ============================================================
+
+# Environment — never commit real credentials
+.env
+
+# Data — never commit raw CMS data files (large; link to CMS source instead)
+data/
+!data/.gitkeep
+
+# Models — tracked in the model registry table; binaries excluded
+models/
+!models/.gitkeep
+
+# Logs
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+
+# Jupyter notebooks — outputs stripped (use nbstripout or clear before commit)
+notebooks/.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker
+.docker/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
