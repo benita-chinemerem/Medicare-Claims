@@ -1,36 +1,26 @@
 # ============================================================
 # fraud-anomaly-ai — Python Dependencies
-# ============================================================
-# Install with: pip install -r requirements.txt
-#
-# Versions are pinned to the same ranges used in the Airflow
-# docker-compose init service to guarantee compatibility.
+# Updated for Python 3.13 compatibility
 # ============================================================
 
 # --- Core data stack ----------------------------------------
-pandas==2.1.4
-numpy==1.26.3
-pyarrow==14.0.2           # Parquet read/write
+pandas==2.2.3             # 2.2.x is the first pandas series with Python 3.13 support
+numpy==2.1.3              # 2.x required for Python 3.13
+pyarrow==18.1.0           # Parquet read/write
 
 # --- Database -----------------------------------------------
-sqlalchemy==2.0.25
-psycopg2-binary==2.9.9    # PostgreSQL adapter
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10   # PostgreSQL adapter
 
 # --- ML models ----------------------------------------------
-scikit-learn==1.4.0       # Isolation Forest, StandardScaler, metrics
-xgboost==2.0.3            # Supervised demonstration layer
-shap==0.44.0              # SHAP explainability
-
-# --- Airflow (for local script development) -----------------
-# apache-airflow is installed inside the Docker container.
-# Listed here only for IDE completion and local DAG testing.
-# Do NOT pip install airflow locally if you intend to use Docker.
-# apache-airflow==2.8.1
+scikit-learn==1.5.2       # Isolation Forest, StandardScaler, metrics
+xgboost==2.1.3            # Supervised demonstration layer
+shap==0.46.0              # SHAP explainability
 
 # --- Testing ------------------------------------------------
-pytest==7.4.4
-pytest-cov==4.1.0
+pytest==8.3.4
+pytest-cov==6.0.0
 
 # --- Utilities ----------------------------------------------
-python-dotenv==1.0.0      # Load .env for local script runs
-tqdm==4.66.1              # Progress bars for long ETL runs
+python-dotenv==1.0.1      # Load .env for local script runs
+tqdm==4.67.1              # Progress bars for long ETL runs
