@@ -2,18 +2,15 @@
 scripts/validate_data.py
 
 Pre-load validation for DE-SynPUF files.
+Updated to match actual DE-SynPUF carrier claims schema (wide/line-level format).
 
-Checks:
-    1. All expected files exist for each sample
-    2. Row counts are within 10% of CMS codebook targets
-    3. Required columns are present in each file
-    4. Primary key fields (clm_id, desynpuf_id, at_physn_npi) are not fully null
-
-Run this before starting DAG 1 to catch data issues early.
+The carrier claims in DE-SynPUF use PRF_PHYSN_NPI_1..13 (performing physician
+per line) rather than AT_PHYSN_NPI. Billing amounts are at line level via
+LINE_ALOWD_CHRG_AMT_1..13 and LINE_NCH_PMT_AMT_1..13.
 
 Usage:
-    python scripts/validate_data.py --raw-path data/raw/
-    python scripts/validate_data.py --raw-path data/raw/ --sample sample_01
+    python3 scripts/validate_data.py --raw-path data/raw/
+    python3 scripts/validate_data.py --raw-path data/raw/ --sample sample_01
 """
 
 from __future__ import annotations
@@ -31,40 +28,37 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
-# -----------------------------------------------------------------------
-# CMS codebook row-count targets (approximate per sample)
-# Source: DE-SynPUF Data Users Guide, CMS 2013
-# -----------------------------------------------------------------------
 CODEBOOK_TARGETS = {
-    "carrier_a":    2_350_000,   # Carrier Claims Part A CSV
-    "carrier_b":    2_350_000,   # Carrier Claims Part B CSV
+    "carrier_a":    2_350_000,
+    "carrier_b":    2_350_000,
     "outpatient":     790_000,
     "bene_2008":      116_352,
     "bene_2009":      116_352,
     "bene_2010":      116_352,
 }
 
-ROW_COUNT_TOLERANCE = 0.10   # allow 10% deviation
+ROW_COUNT_TOLERANCE = 0.10
 
-# -----------------------------------------------------------------------
-# Expected file name patterns per sample
-# Placeholder {SN} = Sample_1 or Sample_2
-# -----------------------------------------------------------------------
 FILE_SPECS = {
     "carrier_a": {
         "pattern": "DE1_0_2008_to_2010_Carrier_Claims_{SN}A.csv",
+        # Actual DE-SynPUF carrier schema: PRF_PHYSN_NPI_* per line, no AT_PHYSN_NPI
         "required_cols": [
-            "DESYNPUF_ID", "CLM_ID", "AT_PHYSN_NPI",
-            "CLM_FROM_DT", "NCH_CARR_CLM_SBMTD_CHRG_AMT",
-            "NCH_CARR_CLM_ALLWD_AMT",
+            "DESYNPUF_ID", "CLM_ID", "CLM_FROM_DT",
+            "PRF_PHYSN_NPI_1",
+            "LINE_ALOWD_CHRG_AMT_1",
+            "LINE_NCH_PMT_AMT_1",
+            "HCPCS_CD_1",
         ],
     },
     "carrier_b": {
         "pattern": "DE1_0_2008_to_2010_Carrier_Claims_{SN}B.csv",
         "required_cols": [
-            "DESYNPUF_ID", "CLM_ID", "AT_PHYSN_NPI",
-            "CLM_FROM_DT", "NCH_CARR_CLM_SBMTD_CHRG_AMT",
-            "NCH_CARR_CLM_ALLWD_AMT",
+            "DESYNPUF_ID", "CLM_ID", "CLM_FROM_DT",
+            "PRF_PHYSN_NPI_1",
+            "LINE_ALOWD_CHRG_AMT_1",
+            "LINE_NCH_PMT_AMT_1",
+            "HCPCS_CD_1",
         ],
     },
     "outpatient": {
@@ -97,14 +91,10 @@ SAMPLE_NAME_MAP = {
 
 
 def validate_sample(raw_path: str, sample: str) -> list[str]:
-    """
-    Validates all expected files for one sample directory.
-    Returns a list of error strings (empty list = all OK).
-    """
     errors: list[str] = []
     sn = SAMPLE_NAME_MAP.get(sample)
     if sn is None:
-        errors.append(f"Unknown sample identifier: '{sample}'. Expected sample_01 or sample_02.")
+        errors.append(f"Unknown sample identifier: '{sample}'.")
         return errors
 
     sample_dir = os.path.join(raw_path, sample)
@@ -116,12 +106,10 @@ def validate_sample(raw_path: str, sample: str) -> list[str]:
         fname = spec["pattern"].replace("{SN}", sn)
         fpath = os.path.join(sample_dir, fname)
 
-        # 1. File existence
         if not os.path.exists(fpath):
             errors.append(f"[{sample}] MISSING: {fname}")
             continue
 
-        # 2. Row count (line count - 1 for header)
         with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
             row_count = sum(1 for _ in fh) - 1
 
@@ -143,7 +131,6 @@ def validate_sample(raw_path: str, sample: str) -> list[str]:
                     sample, fname, row_count, ROW_COUNT_TOLERANCE * 100, target,
                 )
 
-        # 3. Column presence (read only the header row)
         try:
             header_df = pd.read_csv(fpath, nrows=0)
             actual_cols = [c.upper().strip() for c in header_df.columns.tolist()]
@@ -155,14 +142,14 @@ def validate_sample(raw_path: str, sample: str) -> list[str]:
             if col.upper() not in actual_cols:
                 errors.append(f"[{sample}] Missing required column '{col}' in {fname}")
 
-        # 4. Primary key null check (read first 1000 rows)
+        # PK null check on first 1000 rows
         pk_cols_map = {
-            "carrier_a": ["DESYNPUF_ID", "CLM_ID"],
-            "carrier_b": ["DESYNPUF_ID", "CLM_ID"],
+            "carrier_a":  ["DESYNPUF_ID", "CLM_ID"],
+            "carrier_b":  ["DESYNPUF_ID", "CLM_ID"],
             "outpatient": ["DESYNPUF_ID", "CLM_ID"],
-            "bene_2008": ["DESYNPUF_ID"],
-            "bene_2009": ["DESYNPUF_ID"],
-            "bene_2010": ["DESYNPUF_ID"],
+            "bene_2008":  ["DESYNPUF_ID"],
+            "bene_2009":  ["DESYNPUF_ID"],
+            "bene_2010":  ["DESYNPUF_ID"],
         }
         pk_cols = pk_cols_map.get(file_key, [])
         if pk_cols:
@@ -208,14 +195,10 @@ def run_validation(raw_path: str, samples: list[str]) -> bool:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Validate DE-SynPUF files before pipeline run.")
-    parser.add_argument(
-        "--raw-path", default="data/raw/",
-        help="Path to the raw data directory (default: data/raw/)",
-    )
-    parser.add_argument(
-        "--sample", default=None,
-        help="Validate a single sample only (e.g. sample_01). Default: validates all.",
-    )
+    parser.add_argument("--raw-path", default="data/raw/",
+                        help="Path to the raw data directory (default: data/raw/)")
+    parser.add_argument("--sample", default=None,
+                        help="Validate a single sample only. Default: validates all.")
     args = parser.parse_args()
 
     samples_to_check = (
