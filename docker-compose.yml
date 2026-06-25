@@ -1,6 +1,7 @@
 x-airflow-common:
   &airflow-common
-  image: apache/airflow:2.8.1
+  build: .
+  image: fraud-anomaly-ai-airflow:latest
   environment:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
@@ -10,7 +11,6 @@ x-airflow-common:
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
-    # Project env vars
     FRAUD_DB_HOST: ${FRAUD_DB_HOST:-postgres}
     FRAUD_DB_PORT: ${FRAUD_DB_PORT:-5432}
     FRAUD_DB_NAME: ${FRAUD_DB_NAME:-fraud_claims}
@@ -22,14 +22,6 @@ x-airflow-common:
     CONTAMINATION_RATE: ${CONTAMINATION_RATE:-0.05}
     RISK_SCORE_THRESHOLD: ${RISK_SCORE_THRESHOLD:-75}
     WEEKLY_BATCH_SIZE: ${WEEKLY_BATCH_SIZE:-500000}
-    # Packages installed in webserver and scheduler only — not in init
-    _PIP_ADDITIONAL_REQUIREMENTS: >-
-      psycopg2-binary==2.9.9
-      pandas==2.1.4
-      pyarrow==14.0.2
-      scikit-learn==1.4.0
-      xgboost==2.0.3
-      sqlalchemy==2.0.25
   volumes:
     - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
     - ${AIRFLOW_PROJ_DIR:-.}/scripts:/opt/airflow/scripts
@@ -78,7 +70,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 30s
+      start_period: 60s
     restart: always
     depends_on:
       <<: *airflow-common-depends-on
@@ -94,7 +86,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 30s
+      start_period: 60s
     restart: always
     depends_on:
       <<: *airflow-common-depends-on
@@ -117,9 +109,6 @@ services:
       _AIRFLOW_WWW_USER_CREATE: 'true'
       _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
       _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
-      # Override to empty — init only migrates DB and creates user.
-      # It does not run DAG tasks and does not need pandas/sklearn/xgboost.
-      _PIP_ADDITIONAL_REQUIREMENTS: ''
     user: "0:0"
     volumes:
       - ${AIRFLOW_PROJ_DIR:-.}:/sources
