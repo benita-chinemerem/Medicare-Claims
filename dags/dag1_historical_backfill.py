@@ -172,9 +172,19 @@ def load_staging_table(file_type: str, **context):
 
     engine = create_engine(DB_CONN_STR)
     
-    # FIX 1: Use engine.begin() so DDL schema creation auto-commits safely
+    # Ensure the staging schema space AND the load_log table exist before anything else runs
     with engine.begin() as conn:
         conn.execute(text("CREATE SCHEMA IF NOT EXISTS staging;"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS staging.load_log (
+                id SERIAL PRIMARY KEY,
+                table_name TEXT,
+                sample_id INTEGER,
+                file_name TEXT,
+                rows_loaded INTEGER,
+                loaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """))
 
     table_map = {
         "beneficiary": "staging.beneficiary_summary",
@@ -221,7 +231,7 @@ def load_staging_table(file_type: str, **context):
                 )
                 rows_loaded += len(chunk)
 
-            # FIX 2: Use engine.begin() here too so row audits save reliably
+            # Log to load_log (Will now succeed because table is initialized above)
             with engine.begin() as conn:
                 conn.execute(
                     text("""
