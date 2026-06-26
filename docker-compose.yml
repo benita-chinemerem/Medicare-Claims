@@ -78,6 +78,10 @@ services:
         condition: service_completed_successfully
 
   airflow-scheduler:
+    deploy:
+    resources:
+      limits:
+        memory: 4G
     <<: *airflow-common
     container_name: fraud_anomaly_airflow_scheduler
     command: scheduler
