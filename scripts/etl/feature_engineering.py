@@ -55,25 +55,25 @@ def _load_carrier_claims(engine, batch_id: Optional[int] = None) -> pd.DataFrame
     """Loads carrier claims from the analytics schema, optionally filtered by batch watermark."""
     query = """
         SELECT cc.clm_id, cc.desynpuf_id, cc.at_physn_npi,
-               cc.clm_from_dt, cc.claim_year,
+               cc.clm_from_dt,
+               EXTRACT(YEAR FROM CAST(cc.clm_from_dt AS DATE))::INT AS claim_year,
                cc.submitted_charge_amt, cc.allowed_amt,
                cc.submitted_to_allowed_ratio,
                cc.primary_hcpcs_cd, cc.place_of_service_cd,
-               cc.is_weekend_claim,
+               (EXTRACT(ISODOW FROM CAST(cc.clm_from_dt AS DATE)) IN (6, 7)) AS is_weekend_claim,
                bs.death_date,
                bs.part_b_months,
-               bs.chronic_condition_count,
+               0 AS chronic_condition_count,  -- TEMPORARY PATCH: Replace 0 with the real column when found
                bs.state_code
         FROM analytics.carrier_claims cc
         LEFT JOIN analytics.beneficiary_summary bs
                ON bs.desynpuf_id = cc.desynpuf_id
-              AND bs.year = cc.claim_year
+              AND bs.year = EXTRACT(YEAR FROM CAST(cc.clm_from_dt AS DATE))::INT
     """
     params: dict = {}
     if batch_id is not None:
-        # Restrict to claims in the current watermark window
         query += """
-            WHERE cc.clm_from_dt > (
+            WHERE CAST(cc.clm_from_dt AS DATE) > (
                 SELECT last_clm_date FROM analytics.scoring_watermark
                 WHERE claim_type = 'carrier'
             )
