@@ -17,8 +17,10 @@ KEY SCHEMA FACTS (actual DE-SynPUF carrier claims):
 
 from __future__ import annotations
 
+import csv
 import logging
 import os
+from io import StringIO
 from typing import Optional
 
 import pandas as pd
@@ -33,7 +35,28 @@ CARRIER_PMT_COLS      = [f"line_nch_pmt_amt_{i}"      for i in range(1, 14)]
 OUTPATIENT_HCPCS_COLS = [f"hcpcs_cd_{i}"              for i in range(1, 46)]
 OUTPATIENT_REV_COLS   = [f"revenue_cd_{i}"             for i in range(1, 6)]
 
-CHUNK_SIZE = 50_000
+# Chunk sizes optimized for table widths to balance network and memory speed
+BENEFICIARY_CHUNK_SIZE = 50_000
+CLAIMS_CHUNK_SIZE      = 20_000
+
+
+def psql_insert_copy(table, conn, keys, data_iter):
+    """
+    Executes a high-performance bulk insertion using the PostgreSQL COPY engine.
+    Dramatically reduces database CPU, RAM, and WAL overhead compared to standard INSERTs.
+    """
+    dbapi_conn = conn.connection
+    with dbapi_conn.cursor() as cur:
+        s_buf = StringIO()
+        writer = csv.writer(s_buf)
+        writer.writerows(data_iter)
+        s_buf.seek(0)
+
+        columns = ', '.join([f'"{k}"' for k in keys])
+        table_name = f'"{table.schema}"."{table.name}"' if table.schema else f'"{table.name}"'
+        
+        sql = f'COPY {table_name} ({columns}) FROM STDIN WITH CSV'
+        cur.copy_expert(sql=sql, file=s_buf)
 
 
 def _safe_date(val) -> Optional[str]:
@@ -64,86 +87,86 @@ def _build_array(row: pd.Series, cols: list[str]) -> list[str]:
 
 def transform_beneficiary(engine) -> int:
     log.info("Transforming beneficiary_summary in memory-safe chunks...")
-    
-    # SAFEGUARD: Use chunksize to read data sequentially and prevent container OOMs
-    try:
-        chunks = pd.read_sql("SELECT * FROM staging.beneficiary_summary", engine, chunksize=CHUNK_SIZE)
-    except Exception as e:
-        log.error("Failed to read staging.beneficiary_summary: %s", e)
-        return 0
-
     rows_written = 0
-    for df in chunks:
-        if df.empty:
-            continue
+    
+    # Enforce true server-side streaming context
+    with engine.connect() as conn:
+        streaming_conn = conn.execution_options(stream_results=True)
+        try:
+            chunks = pd.read_sql("SELECT * FROM staging.beneficiary_summary", streaming_conn, chunksize=BENEFICIARY_CHUNK_SIZE)
+        except Exception as e:
+            log.error("Failed to read staging.beneficiary_summary: %s", e)
+            return 0
 
-        # SAFEGUARD: Force columns to lowercase right out of the DB to avoid KeyErrors
-        df.columns = df.columns.str.lower()
+        for df in chunks:
+            if df.empty:
+                continue
 
-        for col in ("bene_birth_dt", "bene_death_dt"):
-            if col in df.columns:
-                df[col] = df[col].apply(_safe_date)
+            df.columns = df.columns.str.lower()
 
-        int_cols = [
-            "bene_hi_cvrage_tot_mons", "bene_smi_cvrage_tot_mons",
-            "bene_hmo_cvrage_tot_mons", "plan_cvrg_mos_num",
-            "sp_alzhdmta", "sp_chf", "sp_chrnkidn", "sp_cncr",
-            "sp_copd", "sp_depressn", "sp_diabetes",
-            "sp_ischmcht", "sp_osteoprs", "sp_ra_oa", "sp_strketia",
-        ]
-        for col in int_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int16")
+            for col in ("bene_birth_dt", "bene_death_dt"):
+                if col in df.columns:
+                    df[col] = df[col].apply(_safe_date)
 
-        float_cols = [
-            "medreimb_ip", "benres_ip", "pppymt_ip",
-            "medreimb_op", "benres_op", "pppymt_op",
-            "medreimb_car", "benres_car", "pppymt_car"
-        ]
-        for col in float_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+            int_cols = [
+                "bene_hi_cvrage_tot_mons", "bene_smi_cvrage_tot_mons",
+                "bene_hmo_cvrage_tot_mons", "plan_cvrg_mos_num",
+                "sp_alzhdmta", "sp_chf", "sp_chrnkidn", "sp_cncr",
+                "sp_copd", "sp_depressn", "sp_diabetes",
+                "sp_ischmcht", "sp_osteoprs", "sp_ra_oa", "sp_strketia",
+            ]
+            for col in int_cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int16")
 
-        out = pd.DataFrame({
-            "desynpuf_id":              df.get("desynpuf_id"),
-            "year":                     df["year"].astype("Int16") if "year" in df.columns else None,
-            "sample_id":                df["sample_id"].astype("Int16") if "sample_id" in df.columns else None,
-            "birth_date":               df.get("bene_birth_dt"),
-            "death_date":               df.get("bene_death_dt"),
-            "sex_cd":                   df["bene_sex_ident_cd"].astype(str).str.strip().replace("nan", None) if "bene_sex_ident_cd" in df.columns else None,
-            "race_cd":                  df["bene_race_cd"].astype(str).str.strip().replace("nan", None) if "bene_race_cd" in df.columns else None,
-            "esrd_ind":                 df["bene_esrd_ind"].astype(str).str.strip().replace("nan", None) if "bene_esrd_ind" in df.columns else None,
-            "state_code":               df["sp_state_code"].astype(str).str.strip().replace("nan", None) if "sp_state_code" in df.columns else None,
-            "county_cd":                df["bene_county_cd"].astype(str).str.strip().replace("nan", None) if "bene_county_cd" in df.columns else None,
-            "part_a_months":            df.get("bene_hi_cvrage_tot_mons"),
-            "part_b_months":            df.get("bene_smi_cvrage_tot_mons"),
-            "hmo_months":               df.get("bene_hmo_cvrage_tot_mons"),
-            "flag_alzheimer":           df.get("sp_alzhdmta"),
-            "flag_chf":                 df.get("sp_chf"),
-            "flag_chronic_kidney":      df.get("sp_chrnkidn"),
-            "flag_cancer":              df.get("sp_cncr"),
-            "flag_copd":                df.get("sp_copd"),
-            "flag_depression":          df.get("sp_depressn"),
-            "flag_diabetes":            df.get("sp_diabetes"),
-            "flag_ischemic_heart":      df.get("sp_ischmcht"),
-            "flag_osteoporosis":        df.get("sp_osteoprs"),
-            "flag_ra_oa":               df.get("sp_ra_oa"),
-            "flag_stroke":              df.get("sp_strketia"),
-            "reimbursement_inpatient":  df.get("medreimb_ip"),
-            "reimbursement_outpatient": df.get("medreimb_op"),
-            "reimbursement_carrier":    df.get("medreimb_car"),
-        })
+            float_cols = [
+                "medreimb_ip", "benres_ip", "pppymt_ip",
+                "medreimb_op", "benres_op", "pppymt_op",
+                "medreimb_car", "benres_car", "pppymt_car"
+            ]
+            for col in float_cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        out = out.dropna(subset=["desynpuf_id", "year"])
-        if out.empty:
-            continue
+            out = pd.DataFrame({
+                "desynpuf_id":              df.get("desynpuf_id"),
+                "year":                     df["year"].astype("Int16") if "year" in df.columns else None,
+                "sample_id":                df["sample_id"].astype("Int16") if "sample_id" in df.columns else None,
+                "birth_date":               df.get("bene_birth_dt"),
+                "death_date":               df.get("bene_death_dt"),
+                "sex_cd":                   df["bene_sex_ident_cd"].astype(str).str.strip().replace("nan", None) if "bene_sex_ident_cd" in df.columns else None,
+                "race_cd":                  df["bene_race_cd"].astype(str).str.strip().replace("nan", None) if "bene_race_cd" in df.columns else None,
+                "esrd_ind":                 df["bene_esrd_ind"].astype(str).str.strip().replace("nan", None) if "bene_esrd_ind" in df.columns else None,
+                "state_code":               df["sp_state_code"].astype(str).str.strip().replace("nan", None) if "sp_state_code" in df.columns else None,
+                "county_cd":                df["bene_county_cd"].astype(str).str.strip().replace("nan", None) if "bene_county_cd" in df.columns else None,
+                "part_a_months":            df.get("bene_hi_cvrage_tot_mons"),
+                "part_b_months":            df.get("bene_smi_cvrage_tot_mons"),
+                "hmo_months":               df.get("bene_hmo_cvrage_tot_mons"),
+                "flag_alzheimer":           df.get("sp_alzhdmta"),
+                "flag_chf":                 df.get("sp_chf"),
+                "flag_chronic_kidney":      df.get("sp_chrnkidn"),
+                "flag_cancer":              df.get("sp_cncr"),
+                "flag_copd":                df.get("sp_copd"),
+                "flag_depression":          df.get("sp_depressn"),
+                "flag_diabetes":            df.get("sp_diabetes"),
+                "flag_ischemic_heart":      df.get("sp_ischmcht"),
+                "flag_osteoporosis":        df.get("sp_osteoprs"),
+                "flag_ra_oa":               df.get("sp_ra_oa"),
+                "flag_stroke":              df.get("sp_strketia"),
+                "reimbursement_inpatient":  df.get("medreimb_ip"),
+                "reimbursement_outpatient": df.get("medreimb_op"),
+                "reimbursement_carrier":    df.get("medreimb_car"),
+            })
 
-        # SAFEGUARD: Removed method="multi" to protect database network overhead
-        out.to_sql(
-            "beneficiary_summary", engine, schema="analytics",
-            if_exists="append", index=False
-        )
-        rows_written += len(out)
+            out = out.dropna(subset=["desynpuf_id", "year"])
+            if out.empty:
+                continue
+
+            out.to_sql(
+                "beneficiary_summary", engine, schema="analytics",
+                if_exists="append", index=False, method=psql_insert_copy
+            )
+            rows_written += len(out)
 
     log.info("beneficiary_summary: %d rows written.", rows_written)
     return rows_written
@@ -151,80 +174,83 @@ def transform_beneficiary(engine) -> int:
 
 def transform_carrier(engine) -> int:
     log.info("Transforming carrier_claims in memory-safe chunks...")
-    try:
-        chunks = pd.read_sql("SELECT * FROM staging.carrier_claims", engine, chunksize=CHUNK_SIZE)
-    except Exception as e:
-        log.error("Failed to read staging.carrier_claims: %s", e)
-        return 0
-
     rows_written = 0
-    for df in chunks:
-        if df.empty:
-            continue
 
-        df.columns = df.columns.str.lower()
+    with engine.connect() as conn:
+        streaming_conn = conn.execution_options(stream_results=True)
+        try:
+            chunks = pd.read_sql("SELECT * FROM staging.carrier_claims", streaming_conn, chunksize=CLAIMS_CHUNK_SIZE)
+        except Exception as e:
+            log.error("Failed to read staging.carrier_claims: %s", e)
+            return 0
 
-        npi_cols_present = [c for c in CARRIER_NPI_COLS if c in df.columns]
-        if not npi_cols_present or "clm_id" not in df.columns:
-            continue
+        for df in chunks:
+            if df.empty:
+                continue
 
-        df["at_physn_npi"] = df[npi_cols_present].bfill(axis=1).iloc[:, 0]
-        df = df.dropna(subset=["clm_id", "at_physn_npi"])
-        df = df[df["at_physn_npi"].str.strip().replace("", float("nan")).notna()]
-        if df.empty:
-            continue
+            df.columns = df.columns.str.lower()
 
-        df["clm_from_dt"] = df["clm_from_dt"].apply(_safe_date)
-        df["clm_thru_dt"] = df["clm_thru_dt"].apply(_safe_date)
-        df = df.dropna(subset=["clm_from_dt"])
-        if df.empty:
-            continue
+            npi_cols_present = [c for c in CARRIER_NPI_COLS if c in df.columns]
+            if not npi_cols_present or "clm_id" not in df.columns:
+                continue
 
-        alowd_cols_present = [c for c in CARRIER_ALOWD_COLS if c in df.columns]
-        pmt_cols_present   = [c for c in CARRIER_PMT_COLS   if c in df.columns]
+            df["at_physn_npi"] = df[npi_cols_present].bfill(axis=1).iloc[:, 0]
+            df = df.dropna(subset=["clm_id", "at_physn_npi"])
+            df = df[df["at_physn_npi"].str.strip().replace("", float("nan")).notna()]
+            if df.empty:
+                continue
 
-        for col in alowd_cols_present + pmt_cols_present:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+            df["clm_from_dt"] = df["clm_from_dt"].apply(_safe_date)
+            df["clm_thru_dt"] = df["clm_thru_dt"].apply(_safe_date)
+            df = df.dropna(subset=["clm_from_dt"])
+            if df.empty:
+                continue
 
-        df["allowed_amt"]  = df[alowd_cols_present].sum(axis=1)
-        df["clm_pmt_amt"]  = df[pmt_cols_present].sum(axis=1)
+            alowd_cols_present = [c for c in CARRIER_ALOWD_COLS if c in df.columns]
+            pmt_cols_present   = [c for c in CARRIER_PMT_COLS   if c in df.columns]
 
-        df["payment_to_allowed_ratio"] = df.apply(
-            lambda r: r["clm_pmt_amt"] / r["allowed_amt"]
-            if r["allowed_amt"] > 0 else None,
-            axis=1,
-        )
+            for col in alowd_cols_present + pmt_cols_present:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-        hcpcs_present = [c for c in CARRIER_HCPCS_COLS if c in df.columns]
-        df["hcpcs_codes"]      = df.apply(lambda r: _build_array(r, hcpcs_present), axis=1)
-        df["primary_hcpcs_cd"] = df["hcpcs_codes"].apply(lambda c: c[0] if c else None)
+            df["allowed_amt"]  = df[alowd_cols_present].sum(axis=1)
+            df["clm_pmt_amt"]  = df[pmt_cols_present].sum(axis=1)
 
-        out = pd.DataFrame({
-            "clm_id":                    df["clm_id"].str.strip(),
-            "desynpuf_id":               df["desynpuf_id"].str.strip(),
-            "at_physn_npi":              df["at_physn_npi"].str.strip(),
-            "clm_from_dt":               df["clm_from_dt"],
-            "clm_thru_dt":               df["clm_thru_dt"],
-            "clm_pmt_amt":               df["clm_pmt_amt"],
-            "allowed_amt":               df["allowed_amt"],
-            "submitted_to_allowed_ratio": df["payment_to_allowed_ratio"],
-            "submitted_charge_amt":       df["allowed_amt"],
-            "primary_hcpcs_cd":          df["primary_hcpcs_cd"],
-            "hcpcs_codes":               df["hcpcs_codes"].apply(
-                                             lambda x: "{" + ",".join(x) + "}" if x else "{}"
-                                         ),
-            "prncpal_dgns_cd":           df.get("icd9_dgns_cd_1", pd.Series([None]*len(df)))
-                                            .astype(str).str.strip().replace("nan", None),
-            "nch_clm_type_cd":           None,
-            "place_of_service_cd":       None,
-            "sample_id":                 df["sample_id"].astype("Int16") if "sample_id" in df.columns else None,
-        })
+            df["payment_to_allowed_ratio"] = df.apply(
+                lambda r: r["clm_pmt_amt"] / r["allowed_amt"]
+                if r["allowed_amt"] > 0 else None,
+                axis=1,
+            )
 
-        out.to_sql(
-            "carrier_claims", engine, schema="analytics",
-            if_exists="append", index=False
-        )
-        rows_written += len(out)
+            hcpcs_present = [c for c in CARRIER_HCPCS_COLS if c in df.columns]
+            df["hcpcs_codes"]      = df.apply(lambda r: _build_array(r, hcpcs_present), axis=1)
+            df["primary_hcpcs_cd"] = df["hcpcs_codes"].apply(lambda c: c[0] if c else None)
+
+            out = pd.DataFrame({
+                "clm_id":                    df["clm_id"].str.strip(),
+                "desynpuf_id":               df["desynpuf_id"].str.strip(),
+                "at_physn_npi":              df["at_physn_npi"].str.strip(),
+                "clm_from_dt":               df["clm_from_dt"],
+                "clm_thru_dt":               df["clm_thru_dt"],
+                "clm_pmt_amt":               df["clm_pmt_amt"],
+                "allowed_amt":               df["allowed_amt"],
+                "submitted_to_allowed_ratio": df["payment_to_allowed_ratio"],
+                "submitted_charge_amt":       df["allowed_amt"],
+                "primary_hcpcs_cd":          df["primary_hcpcs_cd"],
+                "hcpcs_codes":               df["hcpcs_codes"].apply(
+                                                 lambda x: "{" + ",".join(x) + "}" if x else "{}"
+                                             ),
+                "prncpal_dgns_cd":           df.get("icd9_dgns_cd_1", pd.Series([None]*len(df)))
+                                                .astype(str).str.strip().replace("nan", None),
+                "nch_clm_type_cd":           None,
+                "place_of_service_cd":       None,
+                "sample_id":                 df["sample_id"].astype("Int16") if "sample_id" in df.columns else None,
+            })
+
+            out.to_sql(
+                "carrier_claims", engine, schema="analytics",
+                if_exists="append", index=False, method=psql_insert_copy
+            )
+            rows_written += len(out)
 
     log.info("carrier_claims: %d rows written to analytics schema.", rows_written)
     return rows_written
@@ -232,57 +258,60 @@ def transform_carrier(engine) -> int:
 
 def transform_outpatient(engine) -> int:
     log.info("Transforming outpatient_claims in memory-safe chunks...")
-    try:
-        chunks = pd.read_sql("SELECT * FROM staging.outpatient_claims", engine, chunksize=CHUNK_SIZE)
-    except Exception as e:
-        log.error("Failed to read staging.outpatient_claims: %s", e)
-        return 0
-
     rows_written = 0
-    for df in chunks:
-        if df.empty:
-            continue
 
-        df.columns = df.columns.str.lower()
+    with engine.connect() as conn:
+        streaming_conn = conn.execution_options(stream_results=True)
+        try:
+            chunks = pd.read_sql("SELECT * FROM staging.outpatient_claims", streaming_conn, chunksize=CLAIMS_CHUNK_SIZE)
+        except Exception as e:
+            log.error("Failed to read staging.outpatient_claims: %s", e)
+            return 0
 
-        if "clm_id" not in df.columns:
-            continue
+        for df in chunks:
+            if df.empty:
+                continue
 
-        df = df.dropna(subset=["clm_id"])
-        df["clm_from_dt"] = df["clm_from_dt"].apply(_safe_date)
-        df["clm_thru_dt"] = df["clm_thru_dt"].apply(_safe_date)
-        df = df.dropna(subset=["clm_from_dt"])
-        if df.empty:
-            continue
+            df.columns = df.columns.str.lower()
 
-        df["clm_pmt_amt"] = pd.to_numeric(df["clm_pmt_amt"], errors="coerce")
+            if "clm_id" not in df.columns:
+                continue
 
-        hcpcs_present = [c for c in OUTPATIENT_HCPCS_COLS if c in df.columns]
-        rev_present   = [c for c in OUTPATIENT_REV_COLS   if c in df.columns]
+            df = df.dropna(subset=["clm_id"])
+            df["clm_from_dt"] = df["clm_from_dt"].apply(_safe_date)
+            df["clm_thru_dt"] = df["clm_thru_dt"].apply(_safe_date)
+            df = df.dropna(subset=["clm_from_dt"])
+            if df.empty:
+                continue
 
-        df["hcpcs_codes"]  = df.apply(lambda r: _build_array(r, hcpcs_present), axis=1)
-        df["revenue_codes"] = df.apply(lambda r: _build_array(r, rev_present), axis=1)
+            df["clm_pmt_amt"] = pd.to_numeric(df["clm_pmt_amt"], errors="coerce")
 
-        out = pd.DataFrame({
-            "clm_id":          df["clm_id"].str.strip(),
-            "desynpuf_id":     df["desynpuf_id"].str.strip(),
-            "prvdr_num":       df.get("prvdr_num", pd.Series([None]*len(df))).astype(str).str.strip().replace("nan", None),
-            "at_physn_npi":    df.get("at_physn_npi", pd.Series([None]*len(df))).astype(str).str.strip().replace("nan", None),
-            "clm_from_dt":     df["clm_from_dt"],
-            "clm_thru_dt":     df["clm_thru_dt"],
-            "clm_pmt_amt":     df["clm_pmt_amt"],
-            "clm_fac_type_cd": df.get("clm_fac_type_cd", pd.Series([None]*len(df))).astype(str).str.strip().replace("nan", None),
-            "prncpal_dgns_cd": df.get("icd9_dgns_cd_1", pd.Series([None]*len(df))).astype(str).str.strip().replace("nan", None),
-            "hcpcs_codes":     df["hcpcs_codes"].apply(lambda x: "{" + ",".join(x) + "}" if x else "{}"),
-            "revenue_codes":   df["revenue_codes"].apply(lambda x: "{" + ",".join(x) + "}" if x else "{}"),
-            "sample_id":       df["sample_id"].astype("Int16") if "sample_id" in df.columns else None,
-        })
+            hcpcs_present = [c for c in OUTPATIENT_HCPCS_COLS if c in df.columns]
+            rev_present   = [c for c in OUTPATIENT_REV_COLS   if c in df.columns]
 
-        out.to_sql(
-            "outpatient_claims", engine, schema="analytics",
-            if_exists="append", index=False
-        )
-        rows_written += len(out)
+            df["hcpcs_codes"]  = df.apply(lambda r: _build_array(r, hcpcs_present), axis=1)
+            df["revenue_codes"] = df.apply(lambda r: _build_array(r, rev_present), axis=1)
+
+            out = pd.DataFrame({
+                "clm_id":          df["clm_id"].str.strip(),
+                "desynpuf_id":     df["desynpuf_id"].str.strip(),
+                "prvdr_num":       df.get("prvdr_num", pd.Series([None]*len(df))).astype(str).str.strip().replace("nan", None),
+                "at_physn_npi":    df.get("at_physn_npi", pd.Series([None]*len(df))).astype(str).str.strip().replace("nan", None),
+                "clm_from_dt":     df["clm_from_dt"],
+                "clm_thru_dt":     df["clm_thru_dt"],
+                "clm_pmt_amt":     df["clm_pmt_amt"],
+                "clm_fac_type_cd": df.get("clm_fac_type_cd", pd.Series([None]*len(df))).astype(str).str.strip().replace("nan", None),
+                "prncpal_dgns_cd": df.get("icd9_dgns_cd_1", pd.Series([None]*len(df))).astype(str).str.strip().replace("nan", None),
+                "hcpcs_codes":     df["hcpcs_codes"].apply(lambda x: "{" + ",".join(x) + "}" if x else "{}"),
+                "revenue_codes":   df["revenue_codes"].apply(lambda x: "{" + ",".join(x) + "}" if x else "{}"),
+                "sample_id":       df["sample_id"].astype("Int16") if "sample_id" in df.columns else None,
+            })
+
+            out.to_sql(
+                "outpatient_claims", engine, schema="analytics",
+                if_exists="append", index=False, method=psql_insert_copy
+            )
+            rows_written += len(out)
 
     log.info("outpatient_claims: %d rows written.", rows_written)
     return rows_written
@@ -294,7 +323,6 @@ def run_all_transforms(db_conn_str: str) -> None:
     """
     engine = create_engine(db_conn_str)
     
-    # 💥 FIX: Ensure the target analytics schema exists before running transforms
     log.info("Ensuring 'analytics' schema exists in PostgreSQL...")
     with engine.begin() as conn:
         conn.execute(text("CREATE SCHEMA IF NOT EXISTS analytics;"))
