@@ -171,6 +171,11 @@ def load_staging_table(file_type: str, **context):
     from sqlalchemy import create_engine, text
 
     engine = create_engine(DB_CONN_STR)
+    
+    # FIX 1: Use engine.begin() so DDL schema creation auto-commits safely
+    with engine.begin() as conn:
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS staging;"))
+
     table_map = {
         "beneficiary": "staging.beneficiary_summary",
         "carrier":     "staging.carrier_claims",
@@ -216,8 +221,8 @@ def load_staging_table(file_type: str, **context):
                 )
                 rows_loaded += len(chunk)
 
-            # Log to load_log
-            with engine.connect() as conn:
+            # FIX 2: Use engine.begin() here too so row audits save reliably
+            with engine.begin() as conn:
                 conn.execute(
                     text("""
                         INSERT INTO staging.load_log
@@ -227,7 +232,6 @@ def load_staging_table(file_type: str, **context):
                     {"tbl": target_table, "sid": sample_idx,
                      "fname": pq_file, "rows": rows_loaded},
                 )
-                conn.commit()
 
             log.info("Loaded %d rows from %s", rows_loaded, pq_file)
 
