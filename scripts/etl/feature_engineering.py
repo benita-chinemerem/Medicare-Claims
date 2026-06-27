@@ -1,27 +1,14 @@
 """
 scripts/etl/feature_engineering.py
 
-Provider-level feature computation for fraud anomaly detection.
+Provider-level feature computation — SQL-based approach.
 
-Reads from the analytics schema and writes one row per (at_physn_npi, period_year)
-to features.provider_features. All 18 features correspond directly to the
-fraud signal categories described in the white paper (Section 5).
-
-Feature groups:
-    - Volume and velocity
-    - HCPCS procedure code concentration
-    - Billing amount ratios
-    - Beneficiary characteristics
-    - Place-of-service patterns
-    - Temporal billing patterns
-    - Duplicate and near-duplicate claim detection
-    - Post-death billing
+All heavy aggregations run inside PostgreSQL. Python only receives the
+final aggregated provider-year rows (typically 10K-50K rows), never the
+full 9M+ raw claim dataset. This avoids the OOM kill that occurs when
+loading all carrier claims into a pandas DataFrame.
 
 Called by DAG 2 (dag2_weekly_scoring.py) on each weekly run.
-Can also be run standalone for a full feature refresh.
-
-Usage:
-    python scripts/etl/feature_engineering.py [--batch-id N]
 """
 
 from __future__ import annotations
@@ -31,14 +18,13 @@ import logging
 import os
 from typing import Optional
 
-import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, text
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-CHUNK_SIZE = 10_000
+CHUNK_SIZE = 5_000
 
 
 def _get_db_conn_str() -> str:
@@ -51,75 +37,247 @@ def _get_db_conn_str() -> str:
     )
 
 
-def _load_carrier_claims(engine, batch_id: Optional[int] = None) -> pd.DataFrame:
-    """Loads carrier claims from the analytics schema, optionally filtered by batch watermark."""
-    query = """
-        SELECT cc.clm_id, cc.desynpuf_id, cc.at_physn_npi,
-               cc.clm_from_dt,
-               EXTRACT(YEAR FROM CAST(cc.clm_from_dt AS DATE))::INT AS claim_year,
-               cc.submitted_charge_amt, cc.allowed_amt,
-               cc.submitted_to_allowed_ratio,
-               cc.primary_hcpcs_cd, cc.place_of_service_cd,
-               (EXTRACT(ISODOW FROM CAST(cc.clm_from_dt AS DATE)) IN (6, 7)) AS is_weekend_claim,
-               bs.death_date,
-               bs.part_b_months,
-               0 AS chronic_condition_count,  -- TEMPORARY PATCH: Replace 0 with the real column when found
-               bs.state_code
-        FROM analytics.carrier_claims cc
-        LEFT JOIN analytics.beneficiary_summary bs
-               ON bs.desynpuf_id = cc.desynpuf_id
-              AND bs.year = EXTRACT(YEAR FROM CAST(cc.clm_from_dt AS DATE))::INT
-    """
-    params: dict = {}
-    if batch_id is not None:
-        query += """
-            WHERE CAST(cc.clm_from_dt AS DATE) > (
-                SELECT last_clm_date FROM analytics.scoring_watermark
-                WHERE claim_type = 'carrier'
-            )
-        """
-    return pd.read_sql(text(query), engine, params=params)
+# ---------------------------------------------------------------------------
+# All feature computation runs as SQL inside PostgreSQL.
+# Python only receives the final aggregated rows.
+# ---------------------------------------------------------------------------
 
+FEATURES_SQL = """
+WITH
 
-def _detect_duplicates(claims: pd.DataFrame) -> pd.DataFrame:
-    """
-    Identifies exact and near-duplicate claim pairs within each provider's claims.
+-- 1. Create a base layer to parse dates efficiently so we don't repeat work
+base_claims AS (
+    SELECT 
+        cc.*,
+        LEFT(cc.clm_from_dt, 4)::INT AS claim_year,
+        -- ISODOW returns 6 for Saturday, 7 for Sunday
+        CASE WHEN EXTRACT(ISODOW FROM cc.clm_from_dt::DATE) IN (6, 7) THEN True ELSE False END AS is_weekend_claim
+    FROM analytics.carrier_claims cc
+    {where_clause_base}
+),
 
-    Exact duplicate: same desynpuf_id + primary_hcpcs_cd + clm_from_dt
-    Near duplicate:  same desynpuf_id + primary_hcpcs_cd, dates within 3 days
+-- 2. Base carrier claim stats per provider per year
+carrier_base AS (
+    SELECT
+        cc.at_physn_npi,
+        cc.claim_year,
+        COUNT(*)                                                      AS total_carrier_claims,
+        COUNT(DISTINCT cc.desynpuf_id)                                AS distinct_beneficiaries,
+        COUNT(DISTINCT cc.primary_hcpcs_cd)                           AS distinct_hcpcs_codes,
+        COUNT(DISTINCT cc.place_of_service_cd)                        AS distinct_pos_codes,
+        COUNT(DISTINCT bs.state_code)                                 AS beneficiaries_per_state,
+        AVG(cc.submitted_to_allowed_ratio)                            AS avg_submitted_to_allowed_ratio,
+        PERCENTILE_CONT(0.95) WITHIN GROUP (
+            ORDER BY cc.submitted_to_allowed_ratio
+        )                                                             AS p95_submitted_to_allowed_ratio,
+        AVG(cc.submitted_charge_amt)                                  AS avg_submitted_charge,
+        AVG(cc.allowed_amt)                                           AS avg_allowed_amt,
+        AVG(CASE WHEN cc.is_weekend_claim THEN 1.0 ELSE 0.0 END)      AS pct_weekend_claims,
+        MAX(daily_counts.day_count)                                   AS max_claims_in_single_day,
+        SUM(CASE WHEN bs.death_date IS NOT NULL
+                  AND cc.clm_from_dt > bs.death_date
+             THEN 1 ELSE 0 END)                                       AS claims_after_bene_death,
+        SUM(CASE WHEN bs.death_date IS NOT NULL
+                  AND cc.claim_year = LEFT(bs.death_date, 4)::INT
+             THEN 1 ELSE 0 END)                                       AS claims_in_bene_death_year,
+        AVG(CASE WHEN bc.chronic_condition_count >= 3
+             THEN 1.0 ELSE 0.0 END)                                   AS high_chronic_burden_benes_pct,
+        AVG(CASE WHEN cc.place_of_service_cd = '11'
+             THEN 1.0 ELSE 0.0 END)                                   AS pct_claims_office,
+        AVG(CASE WHEN cc.place_of_service_cd = '12'
+             THEN 1.0 ELSE 0.0 END)                                   AS pct_claims_home,
+        AVG(CASE WHEN cc.place_of_service_cd = '31'
+             THEN 1.0 ELSE 0.0 END)                                   AS pct_claims_nursing_facility
+    FROM base_claims cc
+    LEFT JOIN analytics.beneficiary_summary bs
+           ON bs.desynpuf_id = cc.desynpuf_id
+          AND bs.year = cc.claim_year
+    LEFT JOIN (
+        SELECT desynpuf_id, year,
+            (CASE WHEN flag_alzheimer    = 1 THEN 1 ELSE 0 END +
+             CASE WHEN flag_chf          = 1 THEN 1 ELSE 0 END +
+             CASE WHEN flag_chronic_kidney = 1 THEN 1 ELSE 0 END +
+             CASE WHEN flag_cancer       = 1 THEN 1 ELSE 0 END +
+             CASE WHEN flag_copd         = 1 THEN 1 ELSE 0 END +
+             CASE WHEN flag_depression   = 1 THEN 1 ELSE 0 END +
+             CASE WHEN flag_diabetes     = 1 THEN 1 ELSE 0 END +
+             CASE WHEN flag_ischemic_heart = 1 THEN 1 ELSE 0 END +
+             CASE WHEN flag_osteoporosis = 1 THEN 1 ELSE 0 END +
+             CASE WHEN flag_ra_oa        = 1 THEN 1 ELSE 0 END +
+             CASE WHEN flag_stroke       = 1 THEN 1 ELSE 0 END
+            ) AS chronic_condition_count
+        FROM analytics.beneficiary_summary
+    ) bc ON bc.desynpuf_id = cc.desynpuf_id AND bc.year = cc.claim_year
+    LEFT JOIN (
+        SELECT at_physn_npi, claim_year, MAX(cnt) AS day_count
+        FROM (
+            SELECT at_physn_npi, claim_year,
+                   cc.clm_from_dt::DATE AS claim_date,
+                   COUNT(*) AS cnt
+            FROM base_claims cc
+            GROUP BY at_physn_npi, claim_year, cc.clm_from_dt::DATE
+        ) daily
+        GROUP BY at_physn_npi, claim_year
+    ) daily_counts
+    ON daily_counts.at_physn_npi = cc.at_physn_npi
+   AND daily_counts.claim_year   = cc.claim_year
+    GROUP BY cc.at_physn_npi, cc.claim_year
+),
 
-    Returns a DataFrame with columns [at_physn_npi, exact_dups, near_dups].
-    """
-    claims = claims.copy()
-    claims["clm_from_dt"] = pd.to_datetime(claims["clm_from_dt"])
+-- 3. Claims per beneficiary ratio
+claims_per_bene AS (
+    SELECT
+        at_physn_npi,
+        claim_year,
+        AVG(bene_claims) AS avg_claims_per_beneficiary,
+        AVG(bene_claims) AS carrier_claims_per_bene
+    FROM (
+        SELECT at_physn_npi, claim_year, desynpuf_id,
+               COUNT(*) AS bene_claims
+        FROM base_claims
+        GROUP BY at_physn_npi, claim_year, desynpuf_id
+    ) bene_counts
+    GROUP BY at_physn_npi, claim_year
+),
 
-    results = []
-    for npi, group in claims.groupby("at_physn_npi"):
-        group = group.sort_values("clm_from_dt")
+-- 4. Optimized HCPCS stats (Using Window Functions instead of Correlated Subqueries)
+hcpcs_counts AS (
+    SELECT at_physn_npi, claim_year, primary_hcpcs_cd, COUNT(*) as code_count
+    FROM base_claims
+    GROUP BY at_physn_npi, claim_year, primary_hcpcs_cd
+),
+hcpcs_ranked AS (
+    SELECT at_physn_npi, claim_year, primary_hcpcs_cd, code_count,
+           ROW_NUMBER() OVER(PARTITION BY at_physn_npi, claim_year ORDER BY code_count DESC) as rn,
+           SUM(code_count) OVER(PARTITION BY at_physn_npi, claim_year) as total_claims
+    FROM hcpcs_counts
+),
+hcpcs_stats AS (
+    SELECT at_physn_npi, claim_year,
+           MAX(CASE WHEN rn = 1 THEN primary_hcpcs_cd END) AS top_hcpcs_code,
+           MAX(CASE WHEN rn = 1 THEN code_count::NUMERIC / total_claims END) AS top_hcpcs_code_share,
+           SUM((code_count::NUMERIC / total_claims)^2) AS hcpcs_concentration_score
+    FROM hcpcs_ranked
+    GROUP BY at_physn_npi, claim_year
+),
 
-        # Exact duplicates
-        exact_key = ["desynpuf_id", "primary_hcpcs_cd", "clm_from_dt"]
-        exact_dups = group.duplicated(subset=exact_key, keep=False).sum()
+-- 5. Exact duplicate detection
+exact_dups AS (
+    SELECT at_physn_npi, claim_year, COUNT(*) AS exact_duplicate_count
+    FROM (
+        SELECT at_physn_npi, claim_year,
+               desynpuf_id, primary_hcpcs_cd,
+               clm_from_dt::DATE AS claim_date,
+               COUNT(*) AS cnt
+        FROM base_claims
+        GROUP BY at_physn_npi, claim_year,
+                 desynpuf_id, primary_hcpcs_cd,
+                 clm_from_dt::DATE
+        HAVING COUNT(*) > 1
+    ) dups
+    GROUP BY at_physn_npi, claim_year
+),
 
-        # Near-duplicates: same bene + code, dates within 3 days
-        near_dups = 0
-        grouped_bene_code = group.groupby(["desynpuf_id", "primary_hcpcs_cd"])
-        for _, bc_group in grouped_bene_code:
-            if len(bc_group) < 2:
-                continue
-            dates = bc_group["clm_from_dt"].sort_values().values
-            for i in range(len(dates) - 1):
-                diff = (dates[i + 1] - dates[i]).astype("timedelta64[D]").astype(int)
-                if 0 < diff <= 3:
-                    near_dups += 1
+-- 6. Near-duplicate detection (Optimized Date Logic)
+near_dups AS (
+    SELECT a.at_physn_npi, a.claim_year,
+           COUNT(*) AS near_duplicate_count
+    FROM base_claims a
+    JOIN base_claims b
+      ON  a.at_physn_npi      = b.at_physn_npi
+      AND a.desynpuf_id       = b.desynpuf_id
+      AND a.primary_hcpcs_cd  = b.primary_hcpcs_cd
+      AND a.clm_id            < b.clm_id
+      AND a.clm_from_dt::DATE - b.clm_from_dt::DATE BETWEEN -3 AND 3
+    GROUP BY a.at_physn_npi, a.claim_year
+),
 
-        results.append({
-            "at_physn_npi":      npi,
-            "exact_duplicate_count": int(exact_dups),
-            "near_duplicate_count":  int(near_dups),
-        })
+-- 7. Prior year claim count for growth rate
+prior_year AS (
+    SELECT at_physn_npi,
+           claim_year + 1   AS next_year,
+           COUNT(*)         AS prior_period_claim_count
+    FROM base_claims
+    GROUP BY at_physn_npi, claim_year
+),
 
-    return pd.DataFrame(results)
+-- 8. Outpatient stats per provider (Standalone CTE)
+op_stats AS (
+    SELECT at_physn_npi,
+           LEFT(clm_from_dt, 4)::SMALLINT AS claim_year,
+           COUNT(*)         AS total_outpatient_claims,
+           AVG(clm_pmt_amt) AS avg_outpatient_payment
+    FROM analytics.outpatient_claims
+    WHERE at_physn_npi IS NOT NULL
+    GROUP BY at_physn_npi, LEFT(clm_from_dt, 4)::SMALLINT
+)
+
+-- Final join
+SELECT
+    cb.at_physn_npi,
+    cb.claim_year                                      AS period_year,
+    cb.total_carrier_claims,
+    cb.distinct_beneficiaries,
+    cb.distinct_hcpcs_codes,
+    cb.distinct_pos_codes,
+    cb.beneficiaries_per_state,
+    cb.avg_submitted_to_allowed_ratio,
+    cb.p95_submitted_to_allowed_ratio,
+    cb.avg_submitted_charge,
+    cb.avg_allowed_amt,
+    cb.pct_weekend_claims,
+    cb.max_claims_in_single_day,
+    cb.claims_after_bene_death,
+    cb.claims_in_bene_death_year,
+    cb.high_chronic_burden_benes_pct,
+    cb.pct_claims_office,
+    cb.pct_claims_home,
+    cb.pct_claims_nursing_facility,
+    COALESCE(cpb.avg_claims_per_beneficiary, 0)        AS avg_claims_per_beneficiary,
+    COALESCE(cpb.carrier_claims_per_bene, 0)           AS carrier_claims_per_bene,
+    hs.top_hcpcs_code,
+    COALESCE(hs.top_hcpcs_code_share, 0)               AS top_hcpcs_code_share,
+    COALESCE(hs.hcpcs_concentration_score, 0)          AS hcpcs_concentration_score,
+    COALESCE(ed.exact_duplicate_count, 0)              AS exact_duplicate_count,
+    COALESCE(nd.near_duplicate_count, 0)               AS near_duplicate_count,
+    CASE
+        WHEN cb.total_carrier_claims > 0
+        THEN (COALESCE(ed.exact_duplicate_count, 0) +
+              COALESCE(nd.near_duplicate_count, 0))::NUMERIC
+             / cb.total_carrier_claims
+        ELSE 0
+    END                                                AS duplicate_rate,
+    COALESCE(py.prior_period_claim_count, 0)           AS prior_period_claim_count,
+    CASE
+        WHEN COALESCE(py.prior_period_claim_count, 0) > 0
+        THEN (cb.total_carrier_claims - py.prior_period_claim_count)::NUMERIC
+             / py.prior_period_claim_count * 100
+        ELSE NULL
+    END                                                AS claim_volume_growth_pct,
+    COALESCE(op.total_outpatient_claims, 0)            AS total_outpatient_claims,
+    COALESCE(op.avg_outpatient_payment, 0)             AS avg_outpatient_payment,
+    :batch_id                                          AS batch_id
+
+FROM carrier_base cb
+LEFT JOIN claims_per_bene cpb
+       ON cpb.at_physn_npi = cb.at_physn_npi
+      AND cpb.claim_year   = cb.claim_year
+LEFT JOIN hcpcs_stats hs
+       ON hs.at_physn_npi  = cb.at_physn_npi
+      AND hs.claim_year    = cb.claim_year
+LEFT JOIN exact_dups ed
+       ON ed.at_physn_npi  = cb.at_physn_npi
+      AND ed.claim_year    = cb.claim_year
+LEFT JOIN near_dups nd
+       ON nd.at_physn_npi  = cb.at_physn_npi
+      AND nd.claim_year    = cb.claim_year
+LEFT JOIN prior_year py
+       ON py.at_physn_npi  = cb.at_physn_npi
+      AND py.next_year     = cb.claim_year
+LEFT JOIN op_stats op
+       ON op.at_physn_npi  = cb.at_physn_npi
+      AND op.claim_year    = cb.claim_year
+"""
 
 
 def compute_provider_features(
@@ -127,275 +285,68 @@ def compute_provider_features(
     batch_id: Optional[int] = None,
 ) -> int:
     """
-    Main entry point. Computes all provider-level features and upserts
-    into features.provider_features. Returns the number of provider-year
-    rows written.
+    Runs all feature aggregations inside PostgreSQL.
+    Only the final aggregated rows are pulled into Python.
     """
     engine = create_engine(db_conn_str)
 
-    log.info("Loading carrier claims from analytics schema...")
-    claims = _load_carrier_claims(engine, batch_id=batch_id)
+    # For batch runs, we could add WHERE clauses to restrict to recent data.
+    # Updated to perfectly match the new optimized base_claims CTE
+    where_clause_base = ""
 
-    if claims.empty:
-        log.warning("No carrier claims found for feature computation.")
+    sql = FEATURES_SQL.format(
+        where_clause_base=where_clause_base,
+    )
+
+    log.info("Computing provider features via SQL aggregation in PostgreSQL...")
+    log.info("(All heavy computation runs inside the database — no large DataFrame loads)")
+
+    df = pd.read_sql(
+        text(sql),
+        engine,
+        params={"batch_id": batch_id or 0},
+    )
+
+    if df.empty:
+        log.warning("Feature query returned no rows. Ensure analytics tables are populated.")
         return 0
 
-    claims["clm_from_dt"] = pd.to_datetime(claims["clm_from_dt"])
-    claims["claim_year"]  = claims["clm_from_dt"].dt.year
+    log.info("SQL returned %d provider-year feature rows.", len(df))
 
-    log.info("Computing features for %d claim rows across %d providers...",
-             len(claims), claims["at_physn_npi"].nunique())
-
-    # -----------------------------------------------------------------------
-    # 1. Volume and velocity
-    # -----------------------------------------------------------------------
-    vol = (
-        claims.groupby(["at_physn_npi", "claim_year"])
-        .agg(total_carrier_claims=("clm_id", "count"))
-        .reset_index()
-    )
-
-    # Prior year claim count (for growth rate)
-    vol_shifted = vol.copy()
-    vol_shifted["claim_year_next"] = vol_shifted["claim_year"] + 1
-    vol = vol.merge(
-        vol_shifted[["at_physn_npi", "claim_year_next", "total_carrier_claims"]]
-        .rename(columns={
-            "claim_year_next":     "claim_year",
-            "total_carrier_claims": "prior_period_claim_count",
-        }),
-        on=["at_physn_npi", "claim_year"],
-        how="left",
-    )
-    vol["claim_volume_growth_pct"] = (
-        (vol["total_carrier_claims"] - vol["prior_period_claim_count"])
-        / vol["prior_period_claim_count"].replace(0, np.nan)
-        * 100
-    )
-
-    # -----------------------------------------------------------------------
-    # 2. Beneficiary counts and claims per beneficiary
-    # -----------------------------------------------------------------------
-    bene = (
-        claims.groupby(["at_physn_npi", "claim_year"])
-        .agg(
-            distinct_beneficiaries=("desynpuf_id", "nunique"),
-            beneficiaries_per_state=("state_code", "nunique"),
-        )
-        .reset_index()
-    )
-
-    claims_per_bene = (
-        claims.groupby(["at_physn_npi", "claim_year", "desynpuf_id"])
-        .size()
-        .reset_index(name="claims_for_bene")
-        .groupby(["at_physn_npi", "claim_year"])
-        .agg(
-            avg_claims_per_beneficiary=("claims_for_bene", "mean"),
-            carrier_claims_per_bene=("claims_for_bene", "mean"),
-        )
-        .reset_index()
-    )
-
-    high_chronic = (
-        claims[claims["chronic_condition_count"].notna()]
-        .groupby(["at_physn_npi", "claim_year"])
-        .apply(lambda g: (g["chronic_condition_count"] >= 3).mean())
-        .reset_index(name="high_chronic_burden_benes_pct")
-    )
-
-    # -----------------------------------------------------------------------
-    # 3. HCPCS code concentration
-    # -----------------------------------------------------------------------
-    hcpcs_dist = (
-        claims.groupby(["at_physn_npi", "claim_year", "primary_hcpcs_cd"])
-        .size()
-        .reset_index(name="code_count")
-    )
-
-    distinct_codes = (
-        hcpcs_dist.groupby(["at_physn_npi", "claim_year"])
-        .agg(distinct_hcpcs_codes=("primary_hcpcs_cd", "nunique"))
-        .reset_index()
-    )
-
-    total_by_provider = (
-        hcpcs_dist.groupby(["at_physn_npi", "claim_year"])["code_count"]
-        .sum()
-        .reset_index(name="total_claims_for_share")
-    )
-    hcpcs_dist = hcpcs_dist.merge(total_by_provider, on=["at_physn_npi", "claim_year"])
-    hcpcs_dist["share"] = hcpcs_dist["code_count"] / hcpcs_dist["total_claims_for_share"]
-
-    # Herfindahl index: sum of squared shares (concentration measure)
-    hhi = (
-        hcpcs_dist.groupby(["at_physn_npi", "claim_year"])
-        .apply(lambda g: (g["share"] ** 2).sum())
-        .reset_index(name="hcpcs_concentration_score")
-    )
-
-    top_code = (
-        hcpcs_dist.loc[
-            hcpcs_dist.groupby(["at_physn_npi", "claim_year"])["code_count"].idxmax()
-        ][["at_physn_npi", "claim_year", "primary_hcpcs_cd", "share"]]
-        .rename(columns={
-            "primary_hcpcs_cd": "top_hcpcs_code",
-            "share":            "top_hcpcs_code_share",
-        })
-    )
-
-    # -----------------------------------------------------------------------
-    # 4. Billing amount ratios
-    # -----------------------------------------------------------------------
-    billing = (
-        claims.groupby(["at_physn_npi", "claim_year"])
-        .agg(
-            avg_submitted_charge=("submitted_charge_amt", "mean"),
-            avg_allowed_amt=("allowed_amt", "mean"),
-            avg_submitted_to_allowed_ratio=("submitted_to_allowed_ratio", "mean"),
-            p95_submitted_to_allowed_ratio=(
-                "submitted_to_allowed_ratio",
-                lambda x: x.quantile(0.95)
-            ),
-        )
-        .reset_index()
-    )
-
-    # -----------------------------------------------------------------------
-    # 5. Place-of-service breakdown
-    # -----------------------------------------------------------------------
-    def pos_pct(g, code):
-        total = len(g)
-        return (g["place_of_service_cd"] == str(code)).sum() / total if total else 0.0
-
-    pos = (
-        claims.groupby(["at_physn_npi", "claim_year"])
-        .apply(lambda g: pd.Series({
-            "distinct_pos_codes":          g["place_of_service_cd"].nunique(),
-            "pct_claims_office":           pos_pct(g, "11"),
-            "pct_claims_home":             pos_pct(g, "12"),
-            "pct_claims_nursing_facility": pos_pct(g, "31"),
-        }))
-        .reset_index()
-    )
-
-    # -----------------------------------------------------------------------
-    # 6. Temporal patterns
-    # -----------------------------------------------------------------------
-    temporal = (
-        claims.groupby(["at_physn_npi", "claim_year"])
-        .agg(
-            pct_weekend_claims=("is_weekend_claim", "mean"),
-            max_claims_in_single_day=("clm_from_dt", lambda x: x.value_counts().max()),
-        )
-        .reset_index()
-    )
-
-    # -----------------------------------------------------------------------
-    # 7. Post-death billing
-    # -----------------------------------------------------------------------
-    has_death = claims[claims["death_date"].notna()].copy()
-    has_death["death_date"] = pd.to_datetime(has_death["death_date"])
-    has_death["after_death"] = has_death["clm_from_dt"] > has_death["death_date"]
-    has_death["in_death_year"] = (
-        has_death["clm_from_dt"].dt.year == has_death["death_date"].dt.year
-    )
-
-    death_flags = (
-        has_death.groupby(["at_physn_npi", "claim_year"])
-        .agg(
-            claims_after_bene_death=("after_death",  "sum"),
-            claims_in_bene_death_year=("in_death_year", "sum"),
-        )
-        .reset_index()
-    )
-
-    # -----------------------------------------------------------------------
-    # 8. Duplicate detection
-    # -----------------------------------------------------------------------
-    log.info("Computing duplicate claim pairs (this may take a moment)...")
-    dup_df = _detect_duplicates(claims)
-
-    # -----------------------------------------------------------------------
-    # Merge all feature groups
-    # -----------------------------------------------------------------------
-    base = vol.copy()
-
-    for df, cols in [
-        (bene,          ["at_physn_npi", "claim_year"]),
-        (claims_per_bene, ["at_physn_npi", "claim_year"]),
-        (high_chronic,  ["at_physn_npi", "claim_year"]),
-        (distinct_codes, ["at_physn_npi", "claim_year"]),
-        (hhi,           ["at_physn_npi", "claim_year"]),
-        (top_code,      ["at_physn_npi", "claim_year"]),
-        (billing,       ["at_physn_npi", "claim_year"]),
-        (pos,           ["at_physn_npi", "claim_year"]),
-        (temporal,      ["at_physn_npi", "claim_year"]),
-        (death_flags,   ["at_physn_npi", "claim_year"]),
-    ]:
-        base = base.merge(df, on=cols, how="left")
-
-    # Merge duplicate counts (no claim_year dimension — aggregate across years)
-    base = base.merge(dup_df, on="at_physn_npi", how="left")
-
-    # Fill missing duplicate counts with 0
-    for col in ("exact_duplicate_count", "near_duplicate_count",
-                "claims_after_bene_death", "claims_in_bene_death_year"):
-        base[col] = base[col].fillna(0).astype(int)
-
-    # Duplicate rate
-    base["duplicate_rate"] = (
-        (base["exact_duplicate_count"] + base["near_duplicate_count"])
-        / base["total_carrier_claims"].replace(0, np.nan)
-    ).fillna(0)
-
-    # Batch ID
-    base["batch_id"] = batch_id
-
-    # Rename claim_year to period_year
-    base = base.rename(columns={"claim_year": "period_year"})
-
-    # -----------------------------------------------------------------------
-    # Write to features.provider_features (upsert via delete + insert)
-    # -----------------------------------------------------------------------
-    npi_list    = base["at_physn_npi"].unique().tolist()
-    year_list   = base["period_year"].unique().tolist()
+    # Upsert: delete existing rows for these providers/years, then insert
+    npi_list  = df["at_physn_npi"].unique().tolist()
+    year_list = [int(y) for y in df["period_year"].unique().tolist()]
 
     with engine.connect() as conn:
-        if batch_id is not None:
+        if npi_list and year_list:
             conn.execute(
                 text("""
                     DELETE FROM features.provider_features
                     WHERE at_physn_npi = ANY(:npis)
                       AND period_year  = ANY(:years)
                 """),
-                {"npis": npi_list, "years": [int(y) for y in year_list]},
+                {"npis": npi_list, "years": year_list},
             )
-        else:
-            conn.execute(text("TRUNCATE features.provider_features"))
         conn.commit()
 
     rows_written = 0
-    for i in range(0, len(base), CHUNK_SIZE):
-        chunk = base.iloc[i : i + CHUNK_SIZE]
+    for i in range(0, len(df), CHUNK_SIZE):
+        chunk = df.iloc[i: i + CHUNK_SIZE]
         chunk.to_sql(
             "provider_features", engine,
             schema="features", if_exists="append",
             index=False, method="multi",
         )
         rows_written += len(chunk)
+        log.info("Written %d / %d rows...", rows_written, len(df))
 
-    log.info(
-        "Feature engineering complete. %d provider-year rows written to features schema.",
-        rows_written,
-    )
+    log.info("Feature engineering complete. %d provider-year rows written.", rows_written)
     return rows_written
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Compute provider-level fraud-detection features.")
-    parser.add_argument("--batch-id", type=int, default=None,
-                        help="If set, restricts computation to the current scoring batch.")
+    parser = argparse.ArgumentParser(description="Compute provider features via SQL.")
+    parser.add_argument("--batch-id", type=int, default=None)
     args = parser.parse_args()
     compute_provider_features(
         db_conn_str=_get_db_conn_str(),
