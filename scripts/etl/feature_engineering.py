@@ -46,7 +46,7 @@ FEATURES_SQL = """
 WITH
 
 -- 1. Create a base layer to parse dates efficiently so we don't repeat work
-base_claims AS (
+base_claims AS MATERIALIZED (
     SELECT 
         cc.*,
         LEFT(cc.clm_from_dt, 4)::INT AS claim_year,
@@ -178,18 +178,21 @@ exact_dups AS (
     GROUP BY at_physn_npi, claim_year
 ),
 
--- 6. Near-duplicate detection (Optimized Date Logic)
+-- 6. Near-duplicate detection (Optimized Date Logic without Self-Joins)
 near_dups AS (
-    SELECT a.at_physn_npi, a.claim_year,
-           COUNT(*) AS near_duplicate_count
-    FROM base_claims a
-    JOIN base_claims b
-      ON  a.at_physn_npi      = b.at_physn_npi
-      AND a.desynpuf_id       = b.desynpuf_id
-      AND a.primary_hcpcs_cd  = b.primary_hcpcs_cd
-      AND a.clm_id            < b.clm_id
-      AND a.clm_from_dt::DATE - b.clm_from_dt::DATE BETWEEN -3 AND 3
-    GROUP BY a.at_physn_npi, a.claim_year
+    SELECT at_physn_npi, claim_year, SUM(is_near_dup) AS near_duplicate_count
+    FROM (
+        SELECT at_physn_npi, claim_year,
+               CASE 
+                   WHEN (clm_from_dt::DATE - LAG(clm_from_dt::DATE) 
+                         OVER(PARTITION BY at_physn_npi, desynpuf_id, primary_hcpcs_cd 
+                              ORDER BY clm_from_dt::DATE)) BETWEEN 1 AND 3 
+                   THEN 1 
+                   ELSE 0 
+               END AS is_near_dup
+        FROM base_claims
+    ) lag_calc
+    GROUP BY at_physn_npi, claim_year
 ),
 
 -- 7. Prior year claim count for growth rate
