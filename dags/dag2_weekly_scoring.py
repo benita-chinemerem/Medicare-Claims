@@ -24,7 +24,6 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator, ShortCircuitOperator
 from airflow.operators.empty import EmptyOperator
-from airflow.utils.dates import days_ago
 
 log = logging.getLogger(__name__)
 
@@ -57,26 +56,91 @@ CONTAMINATION      = float(os.environ.get("CONTAMINATION_RATE", 0.05))
 
 def create_scoring_run(**context) -> int:
     """
-    Opens a new scoring_run record. Returns the run_id for downstream tasks.
+    Ensures all reporting schemas/tables exist, handles system seeding, 
+    and opens or updates a scoring_run log session cleanly.
     """
     from sqlalchemy import create_engine, text
 
     engine = create_engine(DB_CONN_STR)
     dag_run_id = context["run_id"]
 
-    with engine.connect() as conn:
+    # SELF-HEALING DATABASE INITIALIZATION
+    log.info("Running database guards to verify operational tables...")
+    with engine.begin() as conn:
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS scores;"))
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS analytics;"))
+
+        # Initialize core run telemetry tracking
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS scores.scoring_runs (
+                id SERIAL PRIMARY KEY,
+                dag_run_id VARCHAR(255) NOT NULL UNIQUE,
+                run_type VARCHAR(50) NOT NULL,
+                status VARCHAR(50) DEFAULT 'running',
+                model_id INT,
+                batch_id INT,
+                carrier_claims_processed INT,
+                providers_scored INT,
+                providers_flagged INT,
+                error_message TEXT,
+                execution_date TIMESTAMP DEFAULT NOW(),
+                completed_at TIMESTAMP
+            );
+        """))
+
+        # Initialize mock ML registry tracking structures
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS scores.model_registry (
+                model_id SERIAL PRIMARY KEY,
+                model_type VARCHAR(50) NOT NULL,
+                is_active BOOLEAN DEFAULT FALSE,
+                registered_at TIMESTAMP DEFAULT NOW()
+            );
+        """))
+
+        # Initialize score evaluation output targets
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS scores.provider_risk_scores (
+                id SERIAL PRIMARY KEY,
+                scoring_run_id INT REFERENCES scores.scoring_runs(id),
+                at_physn_npi VARCHAR(50),
+                risk_score FLOAT,
+                batch_id INT
+            );
+        """))
+
+        # Initialize and bootstrap processing stream counters
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS analytics.scoring_watermark (
+                claim_type VARCHAR(50) PRIMARY KEY,
+                last_clm_date DATE,
+                batch_id INT,
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+        """))
+
+        # Seed initial incremental pipeline state tracker if empty
+        conn.execute(text("""
+            INSERT INTO analytics.scoring_watermark (claim_type, last_clm_date, batch_id)
+            VALUES ('carrier', '1970-01-01', 0)
+            ON CONFLICT (claim_type) DO NOTHING;
+        """))
+
+    log.info("Database schemas ready. Opening scoring log entry...")
+    with engine.begin() as conn:
         result = conn.execute(
             text("""
                 INSERT INTO scores.scoring_runs (dag_run_id, run_type)
                 VALUES (:dag_run_id, 'weekly')
+                ON CONFLICT (dag_run_id) DO UPDATE 
+                SET status = 'running'
                 RETURNING id
             """),
             {"dag_run_id": dag_run_id},
         )
         run_id = result.scalar()
-        conn.commit()
 
-    log.info("Created scoring run: %d", run_id)
+    log.info("Created or recycled scoring run session token: %d", run_id)
     context["ti"].xcom_push(key="scoring_run_id", value=run_id)
     return run_id
 
@@ -86,10 +150,6 @@ def ingest_batch(**context):
     Reads the next WEEKLY_BATCH_SIZE carrier claims not yet processed
     (using the scoring_watermark table to track position) and marks them
     as belonging to this scoring run.
-
-    In a production environment this would read from a live claims feed.
-    Here it simulates the feed by progressively advancing through the
-    held-back portion of the analytics data.
     """
     from sqlalchemy import create_engine, text
     import pandas as pd
@@ -97,8 +157,7 @@ def ingest_batch(**context):
     engine = create_engine(DB_CONN_STR)
     run_id = context["ti"].xcom_pull(key="scoring_run_id")
 
-    with engine.connect() as conn:
-        # Get current watermark
+    with engine.begin() as conn:
         result = conn.execute(
             text("SELECT last_clm_date, batch_id FROM analytics.scoring_watermark WHERE claim_type = 'carrier'")
         )
@@ -106,16 +165,17 @@ def ingest_batch(**context):
         last_date = row[0]
         batch_id  = (row[1] or 0) + 1
 
-        # Read the next slice of carrier claims
+        # Fixed: Explicitly CAST clm_from_dt as a DATE to bypass string mismatch errors
         df = pd.read_sql(
             text("""
                 SELECT at_physn_npi, desynpuf_id, clm_from_dt, clm_id,
                        submitted_charge_amt, allowed_amt,
                        submitted_to_allowed_ratio, primary_hcpcs_cd,
-                       place_of_service_cd, is_weekend_claim
+                       place_of_service_cd,
+                       (EXTRACT(ISODOW FROM CAST(clm_from_dt AS DATE)) IN (6, 7)) AS is_weekend_claim
                 FROM analytics.carrier_claims
-                WHERE clm_from_dt > :last_date
-                ORDER BY clm_from_dt ASC
+                WHERE CAST(clm_from_dt AS DATE) > :last_date
+                ORDER BY CAST(clm_from_dt AS DATE) ASC
                 LIMIT :batch_size
             """),
             conn,
@@ -128,7 +188,6 @@ def ingest_batch(**context):
             context["ti"].xcom_push(key="carrier_count", value=0)
             return
 
-        # Advance watermark
         new_watermark = df["clm_from_dt"].max()
         conn.execute(
             text("""
@@ -138,7 +197,6 @@ def ingest_batch(**context):
             """),
             {"new_date": new_watermark, "bid": batch_id},
         )
-        conn.commit()
 
     context["ti"].xcom_push(key="batch_id", value=batch_id)
     context["ti"].xcom_push(key="carrier_count", value=len(df))
@@ -158,7 +216,6 @@ def refresh_provider_features(**context):
     """
     Calls the feature engineering module to recompute provider-level
     feature vectors for all providers active in the current batch.
-    Writes results to features.provider_features.
     """
     import sys
     sys.path.insert(0, "/opt/airflow/scripts")
@@ -172,7 +229,7 @@ def refresh_provider_features(**context):
 def score_providers(**context):
     """
     Loads the active Isolation Forest model and scores all providers
-    in the current batch. Writes results to scores.provider_risk_scores.
+    in the current batch.
     """
     import sys
     sys.path.insert(0, "/opt/airflow/ml")
@@ -196,8 +253,6 @@ def score_providers(**context):
 def compute_shap_values(**context):
     """
     Generates SHAP values for all flagged providers in this run.
-    Writes per-feature SHAP values and human-readable reason codes
-    to scores.shap_values and updates scores.provider_risk_scores.
     """
     import sys
     sys.path.insert(0, "/opt/airflow/ml")
@@ -223,15 +278,13 @@ def close_scoring_run(**context):
     carrier_count = context["ti"].xcom_pull(key="carrier_count") or 0
     flagged_count = context["ti"].xcom_pull(key="flagged_count") or 0
 
-    with engine.connect() as conn:
-        # Fetch model_id for the currently active model
+    with engine.begin() as conn:
         result = conn.execute(
             text("SELECT model_id FROM scores.model_registry WHERE model_type = 'isolation_forest' AND is_active = TRUE")
         )
         model_row = result.fetchone()
         model_id = model_row[0] if model_row else None
 
-        # Count distinct providers scored this run
         providers_scored = conn.execute(
             text("SELECT COUNT(DISTINCT at_physn_npi) FROM scores.provider_risk_scores WHERE scoring_run_id = :rid"),
             {"rid": run_id},
@@ -258,7 +311,6 @@ def close_scoring_run(**context):
                 "rid": run_id,
             },
         )
-        conn.commit()
 
     log.info(
         "Scoring run %d complete. Providers scored: %d | Flagged: %d",
@@ -275,7 +327,7 @@ def mark_run_failed(**context):
     err_msg = str(context.get("exception", "Unknown error"))
 
     if run_id:
-        with engine.connect() as conn:
+        with engine.begin() as conn:
             conn.execute(
                 text("""
                     UPDATE scores.scoring_runs
@@ -284,7 +336,6 @@ def mark_run_failed(**context):
                 """),
                 {"err": err_msg[:500], "rid": run_id},
             )
-            conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +393,7 @@ with DAG(
     t_close = PythonOperator(
         task_id="close_scoring_run",
         python_callable=close_scoring_run,
-        trigger_rule="all_done",  # runs even if short-circuit fired
+        trigger_rule="all_done",
     )
 
     end = EmptyOperator(task_id="scoring_complete")

@@ -164,13 +164,30 @@ def convert_to_parquet(**context):
 
 def load_staging_table(file_type: str, **context):
     """
-    Generic staging loader. Reads from Parquet, appends sample_id,
-    and bulk-inserts to the appropriate staging table.
+    Generic staging loader. Streams data from Parquet using PyArrow batches,
+    appends sample_id, and bulk-inserts to the appropriate staging table
+    using database-safe chunk sizes to prevent Postgres container crashes.
     """
     import pandas as pd
+    import pyarrow.parquet as pq
     from sqlalchemy import create_engine, text
 
     engine = create_engine(DB_CONN_STR)
+    
+    # Ensure the staging schema space AND the load_log table exist
+    with engine.begin() as conn:
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS staging;"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS staging.load_log (
+                id SERIAL PRIMARY KEY,
+                table_name TEXT,
+                sample_id INTEGER,
+                file_name TEXT,
+                rows_loaded INTEGER,
+                loaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """))
+
     table_map = {
         "beneficiary": "staging.beneficiary_summary",
         "carrier":     "staging.carrier_claims",
@@ -191,33 +208,33 @@ def load_staging_table(file_type: str, **context):
 
         for pq_file in sorted(matching_files):
             pq_path = os.path.join(sample_parquet_dir, pq_file)
-            log.info("Loading %s -> %s", pq_path, target_table)
+            log.info("Streaming %s -> %s", pq_path, target_table)
 
-            df = pd.read_parquet(pq_path)
-            df["sample_id"] = sample_idx
-
-            # Append year column for beneficiary files
-            if file_type == "beneficiary":
-                year = int([p for p in pq_file.split("_") if p.isdigit() and len(p) == 4][0])
-                df["year"] = year
-
-            # Write in chunks to keep memory manageable
-            chunk_size = 100_000
+            pfile = pq.ParquetFile(pq_path)
             rows_loaded = 0
-            for i in range(0, len(df), chunk_size):
-                chunk = df.iloc[i : i + chunk_size]
-                chunk.to_sql(
+            
+            # SAFEGUARD: Drop chunk size to 20k to avoid Postgres query parameter limits
+            chunk_size = 20_000
+            for batch in pfile.iter_batches(batch_size=chunk_size):
+                chunk_df = batch.to_pandas()
+                chunk_df["sample_id"] = sample_idx
+
+                if file_type == "beneficiary":
+                    year = int([p for p in pq_file.split("_") if p.isdigit() and len(p) == 4][0])
+                    chunk_df["year"] = year
+
+                # SAFEGUARD: Removed method="multi" to protect DB memory execution
+                chunk_df.to_sql(
                     target_table.split(".")[1],
                     engine,
                     schema=target_table.split(".")[0],
                     if_exists="append",
                     index=False,
-                    method="multi",
                 )
-                rows_loaded += len(chunk)
+                rows_loaded += len(chunk_df)
 
-            # Log to load_log
-            with engine.connect() as conn:
+            # Log execution data to load_log
+            with engine.begin() as conn:
                 conn.execute(
                     text("""
                         INSERT INTO staging.load_log
@@ -227,10 +244,8 @@ def load_staging_table(file_type: str, **context):
                     {"tbl": target_table, "sid": sample_idx,
                      "fname": pq_file, "rows": rows_loaded},
                 )
-                conn.commit()
 
-            log.info("Loaded %d rows from %s", rows_loaded, pq_file)
-
+            log.info("Successfully loaded %d total rows from %s", rows_loaded, pq_file)
 
 def transform_analytics(**context):
     """
