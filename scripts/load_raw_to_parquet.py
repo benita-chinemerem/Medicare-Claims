@@ -27,6 +27,8 @@ import os
 import time
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 log = logging.getLogger(__name__)
 logging.basicConfig(
@@ -42,9 +44,10 @@ def convert_file(
     csv_path: str,
     parquet_path: str,
     force: bool = False,
+    chunksize: int = 100_000,
 ) -> dict:
     """
-    Converts a single CSV file to Parquet.
+    Converts a single CSV file to Parquet using memory-efficient streaming chunks.
     Returns a summary dict with timing and row count.
     """
     if os.path.exists(parquet_path) and not force:
@@ -54,17 +57,42 @@ def convert_file(
     log.info("Converting: %s", csv_path)
     t0 = time.time()
 
-    # Read all columns as strings — type casting happens in transform_analytics.py
-    df = pd.read_csv(csv_path, dtype=str, low_memory=False)
-
     os.makedirs(os.path.dirname(parquet_path), exist_ok=True)
 
-    df.to_parquet(
-        parquet_path,
-        index=False,
-        engine="pyarrow",
-        compression="snappy",
-    )
+    total_rows = 0
+    writer = None
+
+    try:
+        # Read the file in chunks instead of loading it all into memory
+        chunks = pd.read_csv(csv_path, dtype=str, low_memory=False, chunksize=chunksize)
+        
+        for chunk in chunks:
+            total_rows += len(chunk)
+            
+            # Convert Pandas DataFrame chunk to PyArrow Table
+            table = pa.Table.from_pandas(chunk, preserve_index=False)
+            
+            # Initialize the ParquetWriter with the first chunk's schema
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    parquet_path, 
+                    table.schema, 
+                    compression="snappy"
+                )
+            
+            # Write this chunk to the file
+            writer.write_table(table)
+            
+    except Exception as e:
+        log.error("Failed to convert %s: %s", csv_path, str(e))
+        # Clean up partial file if it fails mid-stream
+        if os.path.exists(parquet_path):
+            os.remove(parquet_path)
+        raise e
+    finally:
+        # Always close the writer to finalize the Parquet file
+        if writer is not None:
+            writer.close()
 
     elapsed = time.time() - t0
     size_mb  = os.path.getsize(parquet_path) / 1_048_576
@@ -72,14 +100,14 @@ def convert_file(
     log.info(
         "Done: %s — %d rows | %.1f MB | %.1fs",
         os.path.basename(parquet_path),
-        len(df),
+        total_rows,
         size_mb,
         elapsed,
     )
     return {
         "status":   "converted",
         "path":     parquet_path,
-        "rows":     len(df),
+        "rows":     total_rows,
         "size_mb":  round(size_mb, 1),
         "elapsed_s": round(elapsed, 1),
     }
