@@ -212,6 +212,8 @@ def load_staging_table(file_type: str, **context):
         "outpatient":  "staging.outpatient_claims",
     }
     target_table = table_map[file_type]
+    with engine.begin() as conn:
+        conn.execute(text(f"TRUNCATE TABLE {target_table};"))
 
     for sample_idx, sample in enumerate(SAMPLES, start=1):
         sample_parquet_dir = os.path.join(PARQUET_PATH, sample)
