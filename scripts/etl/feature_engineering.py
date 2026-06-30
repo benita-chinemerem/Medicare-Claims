@@ -49,8 +49,7 @@ WITH
 base_claims AS MATERIALIZED (
     SELECT 
         cc.*,
-        EXTRACT(YEAR FROM cc.clm_from_dt)::INT AS claim_year,
-        -- ISODOW returns 6 for Saturday, 7 for Sunday
+        EXTRACT(YEAR FROM cc.clm_from_dt::DATE)::INT AS claim_year, -- Cast to DATE
         CASE WHEN EXTRACT(ISODOW FROM cc.clm_from_dt::DATE) IN (6, 7) THEN True ELSE False END AS is_weekend_claim
     FROM analytics.carrier_claims cc
     {where_clause_base}
@@ -210,12 +209,12 @@ prior_year AS (
 -- 8. Outpatient stats per provider (Standalone CTE)
 op_stats AS (
     SELECT at_physn_npi,
-           EXTRACT(YEAR FROM clm_from_dt)::SMALLINT AS claim_year,
+           EXTRACT(YEAR FROM clm_from_dt::DATE)::SMALLINT AS claim_year, -- Cast to DATE
            COUNT(*)         AS total_outpatient_claims,
            AVG(clm_pmt_amt) AS avg_outpatient_payment
     FROM analytics.outpatient_claims
     WHERE at_physn_npi IS NOT NULL
-    GROUP BY at_physn_npi, EXTRACT(YEAR FROM clm_from_dt)::SMALLINT
+    GROUP BY at_physn_npi, EXTRACT(YEAR FROM clm_from_dt::DATE)::SMALLINT -- Cast to DATE
 )
 
 -- Final join
