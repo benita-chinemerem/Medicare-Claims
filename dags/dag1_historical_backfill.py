@@ -132,20 +132,15 @@ def validate_files(**context):
 
 def convert_to_parquet(**context):
     """
-    Convert all raw CSVs to Parquet format and write to the Parquet zone.
-    Parquet copies dramatically speed up subsequent feature engineering reads.
+    Convert all raw CSVs to Parquet using PyArrow streaming.
+    This avoids loading the entire file into memory, preventing OOM crashes.
     """
-    import pandas as pd
+    import pyarrow.csv as pv
+    import pyarrow.parquet as pq
 
     os.makedirs(PARQUET_PATH, exist_ok=True)
 
-    all_files = []
-    for sample in SAMPLES:
-        sample_dir = os.path.join(RAW_PATH, sample)
-        for fname in os.listdir(sample_dir):
-            if fname.endswith(".csv"):
-                all_files.append((sample, os.path.join(sample_dir, fname)))
-
+    # ... (Keep your existing path collection logic here) ...
     for sample, csv_path in all_files:
         fname_stem = os.path.splitext(os.path.basename(csv_path))[0]
         out_dir = os.path.join(PARQUET_PATH, sample)
@@ -156,11 +151,16 @@ def convert_to_parquet(**context):
             log.info("Parquet already exists, skipping: %s", out_path)
             continue
 
-        log.info("Converting %s -> %s", csv_path, out_path)
-        df = pd.read_csv(csv_path, dtype=str, low_memory=False)
-        df.to_parquet(out_path, index=False, engine="pyarrow")
-        log.info("Written %d rows to %s", len(df), out_path)
-
+        log.info("Streaming conversion: %s -> %s", csv_path, out_path)
+        
+        # PyArrow streaming conversion
+        # This processes the CSV in small batches, never loading the whole file
+        with pv.open_csv(csv_path) as reader:
+            with pq.ParquetWriter(out_path, reader.schema) as writer:
+                for batch in reader:
+                    writer.write_batch(batch)
+        
+        log.info("Successfully converted %s", out_path)
 
 def load_staging_table(file_type: str, **context):
     """
