@@ -81,7 +81,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 10G
     <<: *airflow-common
     container_name: fraud_anomaly_airflow_scheduler
     command: scheduler
