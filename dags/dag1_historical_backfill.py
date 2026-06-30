@@ -223,6 +223,9 @@ def load_staging_table(file_type: str, **context):
                     year = int([p for p in pq_file.split("_") if p.isdigit() and len(p) == 4][0])
                     chunk_df["year"] = year
 
+                # FORMAT FIX: Lowercase columns to match Postgres conventions
+                chunk_df.columns = [col.lower() for col in chunk_df.columns]
+
                 # SAFEGUARD: Removed method="multi" to protect DB memory execution
                 chunk_df.to_sql(
                     target_table.split(".")[1],
