@@ -179,11 +179,25 @@ def transform_beneficiary(engine) -> int:
                 if_exists="append", index=False, method=psql_insert_copy
             )
 
-    # High-performance server-side merge that handles cross-chunk duplicates completely
+    # FIX: Explicitly target columns and omit the 'chronic_condition_count' generated field
     log.info("Performing final cross-chunk deduplication and merging to production...")
     merge_sql = """
-        INSERT INTO analytics.beneficiary_summary
-        SELECT DISTINCT ON (desynpuf_id, year) * FROM analytics.stage_beneficiary_summary
+        INSERT INTO analytics.beneficiary_summary (
+            desynpuf_id, year, sample_id, birth_date, death_date, sex_cd, race_cd, esrd_ind, 
+            state_code, county_cd, part_a_months, part_b_months, hmo_months, 
+            flag_alzheimer, flag_chf, flag_chronic_kidney, flag_cancer, flag_copd, 
+            flag_depression, flag_diabetes, flag_ischemic_heart, flag_osteoporosis, 
+            flag_ra_oa, flag_stroke, reimbursement_inpatient, reimbursement_outpatient, 
+            reimbursement_carrier
+        )
+        SELECT DISTINCT ON (desynpuf_id, year) 
+            desynpuf_id, year, sample_id, birth_date, death_date, sex_cd, race_cd, esrd_ind, 
+            state_code, county_cd, part_a_months, part_b_months, hmo_months, 
+            flag_alzheimer, flag_chf, flag_chronic_kidney, flag_cancer, flag_copd, 
+            flag_depression, flag_diabetes, flag_ischemic_heart, flag_osteoporosis, 
+            flag_ra_oa, flag_stroke, reimbursement_inpatient, reimbursement_outpatient, 
+            reimbursement_carrier
+        FROM analytics.stage_beneficiary_summary
         ORDER BY desynpuf_id, year
         ON CONFLICT (desynpuf_id, year) DO NOTHING;
     """
