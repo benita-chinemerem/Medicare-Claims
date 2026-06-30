@@ -132,10 +132,12 @@ def validate_files(**context):
 
 def convert_to_parquet(**context):
     """
-    Convert all raw CSVs to Parquet using PyArrow streaming.
-    This avoids loading the entire file into memory, preventing OOM crashes.
+    Memory-safe CSV → Parquet conversion using streaming batches.
+    Prevents OOM kills (-9) on large DE-SynPUF datasets.
     """
-    import pyarrow.csv as pv
+    import os
+    import pandas as pd
+    import pyarrow as pa
     import pyarrow.parquet as pq
 
     os.makedirs(PARQUET_PATH, exist_ok=True)
@@ -144,32 +146,39 @@ def convert_to_parquet(**context):
     all_files = []
     for sample in SAMPLES:
         sample_dir = os.path.join(RAW_PATH, sample)
-        # Check if the folder exists to avoid errors
-        if os.path.exists(sample_dir):
-            for fname in os.listdir(sample_dir):
-                if fname.endswith(".csv"):
-                    all_files.append((sample, os.path.join(sample_dir, fname)))
+        for fname in os.listdir(sample_dir):
+            if fname.endswith(".csv"):
+                all_files.append((sample, os.path.join(sample_dir, fname)))
 
     # 2. Iterate through the collected files and convert
     for sample, csv_path in all_files:
         fname_stem = os.path.splitext(os.path.basename(csv_path))[0]
         out_dir = os.path.join(PARQUET_PATH, sample)
         os.makedirs(out_dir, exist_ok=True)
+
         out_path = os.path.join(out_dir, f"{fname_stem}.parquet")
 
-        if os.path.exists(out_path):
-            log.info("Parquet already exists, skipping: %s", out_path)
-            continue
+        log.info("Converting (streaming) %s -> %s", csv_path, out_path)
 
-        log.info("Streaming conversion: %s -> %s", csv_path, out_path)
-        
-        # 3. Use PyArrow streaming to process the file in batches
-        with pv.open_csv(csv_path) as reader:
-            with pq.ParquetWriter(out_path, reader.schema) as writer:
-                for batch in reader:
-                    writer.write_batch(batch)
-        
-        log.info("Successfully converted %s", out_path)
+        # Stream CSV in chunks instead of loading full file into memory
+        reader = pd.read_csv(csv_path, dtype=str, chunksize=100_000)
+
+        writer = None
+        total_rows = 0
+
+        for chunk in reader:
+            table = pa.Table.from_pandas(chunk, preserve_index=False)
+
+            if writer is None:
+                writer = pq.ParquetWriter(out_path, table.schema)
+
+            writer.write_table(table)
+            total_rows += len(chunk)
+
+        if writer:
+            writer.close()
+
+        log.info("Written %d rows to %s", total_rows, out_path)
 
 def load_staging_table(file_type: str, **context):
     """
