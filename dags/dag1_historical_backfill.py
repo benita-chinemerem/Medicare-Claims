@@ -140,7 +140,17 @@ def convert_to_parquet(**context):
 
     os.makedirs(PARQUET_PATH, exist_ok=True)
 
-    # ... (Keep your existing path collection logic here) ...
+    # 1. Define the list of files to process
+    all_files = []
+    for sample in SAMPLES:
+        sample_dir = os.path.join(RAW_PATH, sample)
+        # Check if the folder exists to avoid errors
+        if os.path.exists(sample_dir):
+            for fname in os.listdir(sample_dir):
+                if fname.endswith(".csv"):
+                    all_files.append((sample, os.path.join(sample_dir, fname)))
+
+    # 2. Iterate through the collected files and convert
     for sample, csv_path in all_files:
         fname_stem = os.path.splitext(os.path.basename(csv_path))[0]
         out_dir = os.path.join(PARQUET_PATH, sample)
@@ -153,8 +163,7 @@ def convert_to_parquet(**context):
 
         log.info("Streaming conversion: %s -> %s", csv_path, out_path)
         
-        # PyArrow streaming conversion
-        # This processes the CSV in small batches, never loading the whole file
+        # 3. Use PyArrow streaming to process the file in batches
         with pv.open_csv(csv_path) as reader:
             with pq.ParquetWriter(out_path, reader.schema) as writer:
                 for batch in reader:
