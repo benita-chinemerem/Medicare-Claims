@@ -74,12 +74,15 @@ carrier_base AS (
         AVG(cc.allowed_amt)                                           AS avg_allowed_amt,
         AVG(CASE WHEN cc.is_weekend_claim THEN 1.0 ELSE 0.0 END)      AS pct_weekend_claims,
         MAX(daily_counts.day_count)                                   AS max_claims_in_single_day,
+        
         SUM(CASE WHEN bs.death_date IS NOT NULL
-                  AND cc.clm_from_dt > bs.death_date
+                  AND cc.clm_from_dt::DATE > bs.death_date
              THEN 1 ELSE 0 END)                                       AS claims_after_bene_death,
+             
         SUM(CASE WHEN bs.death_date IS NOT NULL
-                  AND cc.claim_year = LEFT(bs.death_date, 4)::INT
+                  AND cc.claim_year = EXTRACT(YEAR FROM bs.death_date)::INT
              THEN 1 ELSE 0 END)                                       AS claims_in_bene_death_year,
+             
         AVG(CASE WHEN bc.chronic_condition_count >= 3
              THEN 1.0 ELSE 0.0 END)                                   AS high_chronic_burden_benes_pct,
         AVG(CASE WHEN cc.place_of_service_cd = '11'
