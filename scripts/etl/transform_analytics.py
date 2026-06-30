@@ -159,6 +159,10 @@ def transform_beneficiary(engine) -> int:
             })
 
             out = out.dropna(subset=["desynpuf_id", "year"])
+            
+            # FIX: Protect against duplicate composite keys within the source chunk
+            out = out.drop_duplicates(subset=["desynpuf_id", "year"], keep="first")
+            
             if out.empty:
                 continue
 
@@ -246,6 +250,9 @@ def transform_carrier(engine) -> int:
                 "sample_id":                 df["sample_id"].astype("Int16") if "sample_id" in df.columns else None,
             })
 
+            # Optional structural guard for claim IDs
+            out = out.drop_duplicates(subset=["clm_id"], keep="first")
+
             out.to_sql(
                 "carrier_claims", engine, schema="analytics",
                 if_exists="append", index=False, method=psql_insert_copy
@@ -306,6 +313,9 @@ def transform_outpatient(engine) -> int:
                 "revenue_codes":   df["revenue_codes"].apply(lambda x: "{" + ",".join(x) + "}" if x else "{}"),
                 "sample_id":       df["sample_id"].astype("Int16") if "sample_id" in df.columns else None,
             })
+
+            # Optional structural guard for outpatient claim IDs
+            out = out.drop_duplicates(subset=["clm_id"], keep="first")
 
             out.to_sql(
                 "outpatient_claims", engine, schema="analytics",
