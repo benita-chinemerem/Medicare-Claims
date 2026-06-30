@@ -160,7 +160,7 @@ def transform_beneficiary(engine) -> int:
 
             out = out.dropna(subset=["desynpuf_id", "year"])
             
-            # FIX: Protect against duplicate composite keys within the source chunk
+            # Protect against duplicate composite keys within the source chunk
             out = out.drop_duplicates(subset=["desynpuf_id", "year"], keep="first")
             
             if out.empty:
@@ -250,7 +250,6 @@ def transform_carrier(engine) -> int:
                 "sample_id":                 df["sample_id"].astype("Int16") if "sample_id" in df.columns else None,
             })
 
-            # Optional structural guard for claim IDs
             out = out.drop_duplicates(subset=["clm_id"], keep="first")
 
             out.to_sql(
@@ -314,7 +313,6 @@ def transform_outpatient(engine) -> int:
                 "sample_id":       df["sample_id"].astype("Int16") if "sample_id" in df.columns else None,
             })
 
-            # Optional structural guard for outpatient claim IDs
             out = out.drop_duplicates(subset=["clm_id"], keep="first")
 
             out.to_sql(
@@ -337,16 +335,24 @@ def run_all_transforms(db_conn_str: str) -> None:
     with engine.begin() as conn:
         conn.execute(text("CREATE SCHEMA IF NOT EXISTS analytics;"))
         
-    # NEW BLOCK
-    log.info("Truncating analytics tables for a clean (retry-safe) run...")
+    # FIX: Run conditional TRUNCATE queries via a Postgres PL/pgSQL block
+    log.info("Truncating analytics tables safely if they exist...")
+    conditional_truncate_script = """
+    DO $$ 
+    BEGIN 
+        IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'analytics' AND tablename = 'beneficiary_summary') THEN
+            TRUNCATE TABLE analytics.beneficiary_summary RESTART IDENTITY CASCADE;
+        END IF;
+        IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'analytics' AND tablename = 'carrier_claims') THEN
+            TRUNCATE TABLE analytics.carrier_claims RESTART IDENTITY CASCADE;
+        END IF;
+        IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'analytics' AND tablename = 'outpatient_claims') THEN
+            TRUNCATE TABLE analytics.outpatient_claims RESTART IDENTITY CASCADE;
+        END IF;
+    END $$;
+    """
     with engine.begin() as conn:
-        conn.execute(text(
-            "TRUNCATE TABLE "
-            "analytics.beneficiary_summary, "
-            "analytics.carrier_claims, "
-            "analytics.outpatient_claims;"
-        ))
-    # END NEW BLOCK
+        conn.execute(text(conditional_truncate_script))
 
     total  = 0
     total += transform_beneficiary(engine)
