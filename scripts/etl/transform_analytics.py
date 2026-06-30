@@ -89,7 +89,14 @@ def transform_beneficiary(engine) -> int:
     log.info("Transforming beneficiary_summary in memory-safe chunks...")
     rows_written = 0
     
-    # Enforce true server-side streaming context
+    # Create an intermediate unlogged staging table to safely hold bulk COPY chunks without constraint friction
+    with engine.begin() as init_conn:
+        init_conn.execute(text("DROP TABLE IF EXISTS analytics.stage_beneficiary_summary;"))
+        init_conn.execute(text(
+            "CREATE UNLOGGED TABLE analytics.stage_beneficiary_summary "
+            "(LIKE analytics.beneficiary_summary EXCLUDING CONSTRAINTS);"
+        ))
+
     with engine.connect() as conn:
         streaming_conn = conn.execution_options(stream_results=True)
         try:
@@ -129,7 +136,7 @@ def transform_beneficiary(engine) -> int:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
 
             out = pd.DataFrame({
-                "desynpuf_id":              df.get("desynpuf_id"),
+                "desynpuf_id":              df["desynpuf_id"].astype(str).str.strip().replace("nan", None) if "desynpuf_id" in df.columns else None,
                 "year":                     df["year"].astype("Int16") if "year" in df.columns else None,
                 "sample_id":                df["sample_id"].astype("Int16") if "sample_id" in df.columns else None,
                 "birth_date":               df.get("bene_birth_dt"),
@@ -160,17 +167,30 @@ def transform_beneficiary(engine) -> int:
 
             out = out.dropna(subset=["desynpuf_id", "year"])
             
-            # Protect against duplicate composite keys within the source chunk
+            # Deduplicate cleanly within the pandas dataframe chunk
             out = out.drop_duplicates(subset=["desynpuf_id", "year"], keep="first")
             
             if out.empty:
                 continue
 
+            # Write directly to intermediate staging table
             out.to_sql(
-                "beneficiary_summary", engine, schema="analytics",
+                "stage_beneficiary_summary", engine, schema="analytics",
                 if_exists="append", index=False, method=psql_insert_copy
             )
-            rows_written += len(out)
+
+    # High-performance server-side merge that handles cross-chunk duplicates completely
+    log.info("Performing final cross-chunk deduplication and merging to production...")
+    merge_sql = """
+        INSERT INTO analytics.beneficiary_summary
+        SELECT DISTINCT ON (desynpuf_id, year) * FROM analytics.stage_beneficiary_summary
+        ORDER BY desynpuf_id, year
+        ON CONFLICT (desynpuf_id, year) DO NOTHING;
+    """
+    with engine.begin() as merge_conn:
+        result = merge_conn.execute(text(merge_sql))
+        rows_written = result.rowcount if result.rowcount is not None else 0
+        merge_conn.execute(text("DROP TABLE IF EXISTS analytics.stage_beneficiary_summary;"))
 
     log.info("beneficiary_summary: %d rows written.", rows_written)
     return rows_written
@@ -335,7 +355,6 @@ def run_all_transforms(db_conn_str: str) -> None:
     with engine.begin() as conn:
         conn.execute(text("CREATE SCHEMA IF NOT EXISTS analytics;"))
         
-    # FIX: Run conditional TRUNCATE queries via a Postgres PL/pgSQL block
     log.info("Truncating analytics tables safely if they exist...")
     conditional_truncate_script = """
     DO $$ 
