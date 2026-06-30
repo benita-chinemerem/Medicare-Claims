@@ -327,6 +327,17 @@ def run_all_transforms(db_conn_str: str) -> None:
     with engine.begin() as conn:
         conn.execute(text("CREATE SCHEMA IF NOT EXISTS analytics;"))
         
+    # NEW BLOCK
+    log.info("Truncating analytics tables for a clean (retry-safe) run...")
+    with engine.begin() as conn:
+        conn.execute(text(
+            "TRUNCATE TABLE "
+            "analytics.beneficiary_summary, "
+            "analytics.carrier_claims, "
+            "analytics.outpatient_claims;"
+        ))
+    # END NEW BLOCK
+
     total  = 0
     total += transform_beneficiary(engine)
     total += transform_carrier(engine)
