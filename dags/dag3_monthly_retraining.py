@@ -218,12 +218,13 @@ def log_retraining_summary(**context):
         f"Training rows: {train_rows}."
     )
 
-    with engine.connect() as conn:
+    # SQLAlchemy 1.4: engine.begin() opens a transaction and auto-commits on
+    # clean exit. engine.connect() does not expose .commit() in SQLAlchemy 1.x.
+    with engine.begin() as conn:
         conn.execute(
             text("UPDATE scores.model_registry SET notes = :n WHERE model_id = :mid"),
             {"n": summary, "mid": new_model_id},
         )
-        conn.commit()
 
     log.info("Retraining summary logged: %s", summary)
 
