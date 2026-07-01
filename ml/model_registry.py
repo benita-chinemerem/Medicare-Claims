@@ -43,7 +43,10 @@ def register_model(
     """
     engine = create_engine(db_conn_str)
 
-    with engine.connect() as conn:
+    # SQLAlchemy 1.4: engine.begin() wraps the block in a transaction and
+    # auto-commits on clean exit (auto-rolls back on exception).
+    # engine.connect() does not expose .commit() in SQLAlchemy 1.x.
+    with engine.begin() as conn:
         result = conn.execute(
             text("""
                 INSERT INTO scores.model_registry (
@@ -76,7 +79,6 @@ def register_model(
             },
         )
         model_id = result.scalar()
-        conn.commit()
 
     log.info("Registered model %s v%s with id=%d (is_active=%s).",
              model_type, model_version, model_id, is_active)
@@ -97,7 +99,9 @@ def promote_model(
     """
     engine = create_engine(db_conn_str)
 
-    with engine.connect() as conn:
+    # SQLAlchemy 1.4: engine.begin() auto-commits both UPDATEs atomically
+    # on clean exit — if either fails, both are rolled back automatically.
+    with engine.begin() as conn:
         # Deactivate all current active models of this type
         conn.execute(
             text("""
@@ -120,7 +124,6 @@ def promote_model(
             """),
             {"notes": notes, "mid": model_id},
         )
-        conn.commit()
 
     log.info("Model id=%d promoted to active for type '%s'.", model_id, model_type)
 
