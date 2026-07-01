@@ -117,6 +117,34 @@ services:
     volumes:
       - ${AIRFLOW_PROJ_DIR:-.}:/sources
 
+  # ---------------------------------------------------------------------------
+  # Metabase — business intelligence / dashboard layer
+  # Connects to the fraud_claims PostgreSQL database (same postgres instance).
+  # Access at http://localhost:3000 after first boot (~60-90 seconds).
+  # Metabase stores its own question/dashboard metadata in the H2 embedded DB
+  # (metabase-data volume), which is fine for a local/demo environment.
+  # ---------------------------------------------------------------------------
+  metabase:
+    image: metabase/metabase:v0.50.0
+    container_name: fraud_anomaly_metabase
+    ports:
+      - "3000:3000"
+    volumes:
+      - metabase-data:/metabase-data
+    environment:
+      MB_DB_FILE: /metabase-data/metabase.db
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
 volumes:
   postgres-db-volume:
   airflow-plugins:
+  metabase-data:

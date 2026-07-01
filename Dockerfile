@@ -11,7 +11,4 @@ RUN pip install --no-cache-dir \
     pyarrow==14.0.2 \
     scikit-learn==1.3.2 \
     xgboost==2.0.3 \
-    # sqlalchemy==2.0.25
-
-# RUN pip install --no-cache-dir --default-timeout=1000 \
-#     xgboost==2.0.3
+    shap==0.46.0
