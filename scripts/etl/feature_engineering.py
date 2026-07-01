@@ -9,6 +9,29 @@ full 9M+ raw claim dataset. This avoids the OOM kill that occurs when
 loading all carrier claims into a pandas DataFrame.
 
 Called by DAG 2 (dag2_weekly_scoring.py) on each weekly run.
+
+FIX (2026-06-30):
+    Root cause of SIGKILL / zombie task:
+        `where_clause_base` was always set to an empty string, so
+        `base_claims` materialized the ENTIRE carrier_claims table on
+        every run (~9M+ rows). PostgreSQL then had to scan and sort that
+        full dataset 7 times in the same query for the various CTEs —
+        particularly `near_dups` (LAG + OVER PARTITION BY + ORDER BY on
+        9M rows) — which exhausted available memory and caused the OOM
+        killer to send SIGKILL to the worker process.
+
+    Fix:
+        A new `active_npis` CTE runs first and identifies only the
+        providers who have claims within the current batch window
+        (batch_start_date → batch_end_date). `base_claims` is then
+        filtered to those NPIs only, but still pulls their full claim
+        history across all years — so prior-year growth features remain
+        accurate. This turns a full-table scan into a targeted NPI-keyed
+        lookup using the existing idx_carrier_npi index.
+
+        A per-session `work_mem` increase is also applied so PostgreSQL
+        has enough buffer for the LAG sort within each partition without
+        spilling to disk.
 """
 
 from __future__ import annotations
@@ -26,6 +49,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 CHUNK_SIZE = 5_000
 
+# Amount of memory given to Postgres for sort operations within this session.
+# Each parallel sort worker gets this much, so keep it reasonable.
+WORK_MEM = os.environ.get("FEATURE_WORK_MEM", "512MB")
+
 
 def _get_db_conn_str() -> str:
     return (
@@ -40,19 +67,38 @@ def _get_db_conn_str() -> str:
 # ---------------------------------------------------------------------------
 # All feature computation runs as SQL inside PostgreSQL.
 # Python only receives the final aggregated rows.
+#
+# FIX: `active_npis` CTE is the new gate that limits `base_claims` to only
+# the providers who had activity within the current batch window.
+# batch_start_date / batch_end_date are passed as bound SQL parameters —
+# NOT Python format strings — so there is no SQL injection risk.
 # ---------------------------------------------------------------------------
 
 FEATURES_SQL = """
 WITH
 
--- 1. Create a base layer to parse dates efficiently so we don't repeat work
+-- 0. FIX: Identify only the providers active in this batch window.
+--    This runs first against idx_carrier_npi + idx_carrier_date so it is fast.
+--    base_claims is then filtered to these NPIs only, but keeps ALL of each
+--    provider's historical years so that prior-year growth features are accurate.
+active_npis AS MATERIALIZED (
+    SELECT DISTINCT at_physn_npi
+    FROM analytics.carrier_claims
+    WHERE clm_from_dt > :batch_start_date
+      AND clm_from_dt <= :batch_end_date
+      AND at_physn_npi IS NOT NULL
+),
+
+-- 1. Create a base layer to parse dates efficiently so we don't repeat work.
+--    FIX: WHERE clause now restricts to active_npis — eliminates the full-table
+--    scan that was causing the OOM SIGKILL on every run.
 base_claims AS MATERIALIZED (
-    SELECT 
+    SELECT
         cc.*,
-        EXTRACT(YEAR FROM cc.clm_from_dt::DATE)::INT AS claim_year, -- Cast to DATE
+        EXTRACT(YEAR FROM cc.clm_from_dt::DATE)::INT AS claim_year,
         CASE WHEN EXTRACT(ISODOW FROM cc.clm_from_dt::DATE) IN (6, 7) THEN True ELSE False END AS is_weekend_claim
     FROM analytics.carrier_claims cc
-    {where_clause_base}
+    WHERE cc.at_physn_npi IN (SELECT at_physn_npi FROM active_npis)
 ),
 
 -- 2. Base carrier claim stats per provider per year
@@ -73,15 +119,15 @@ carrier_base AS (
         AVG(cc.allowed_amt)                                           AS avg_allowed_amt,
         AVG(CASE WHEN cc.is_weekend_claim THEN 1.0 ELSE 0.0 END)      AS pct_weekend_claims,
         MAX(daily_counts.day_count)                                   AS max_claims_in_single_day,
-        
+
         SUM(CASE WHEN bs.death_date IS NOT NULL
                   AND cc.clm_from_dt::DATE > bs.death_date
              THEN 1 ELSE 0 END)                                       AS claims_after_bene_death,
-             
+
         SUM(CASE WHEN bs.death_date IS NOT NULL
                   AND cc.claim_year = EXTRACT(YEAR FROM bs.death_date)::INT
              THEN 1 ELSE 0 END)                                       AS claims_in_bene_death_year,
-             
+
         AVG(CASE WHEN bc.chronic_condition_count >= 3
              THEN 1.0 ELSE 0.0 END)                                   AS high_chronic_burden_benes_pct,
         AVG(CASE WHEN cc.place_of_service_cd = '11'
@@ -142,7 +188,7 @@ claims_per_bene AS (
     GROUP BY at_physn_npi, claim_year
 ),
 
--- 4. Optimized HCPCS stats (Using Window Functions instead of Correlated Subqueries)
+-- 4. Optimized HCPCS stats (window functions instead of correlated subqueries)
 hcpcs_counts AS (
     SELECT at_physn_npi, claim_year, primary_hcpcs_cd, COUNT(*) as code_count
     FROM base_claims
@@ -180,17 +226,21 @@ exact_dups AS (
     GROUP BY at_physn_npi, claim_year
 ),
 
--- 6. Near-duplicate detection (Optimized Date Logic without Self-Joins)
+-- 6. Near-duplicate detection (optimised date logic without self-joins).
+--    NOTE: This CTE contains the heaviest sort in the query
+--    (LAG OVER PARTITION BY at_physn_npi, desynpuf_id, primary_hcpcs_cd).
+--    The active_npis filter above is what keeps this tractable — without it,
+--    this sort ran over 9M+ rows and triggered the OOM SIGKILL.
 near_dups AS (
     SELECT at_physn_npi, claim_year, SUM(is_near_dup) AS near_duplicate_count
     FROM (
         SELECT at_physn_npi, claim_year,
-               CASE 
-                   WHEN (clm_from_dt::DATE - LAG(clm_from_dt::DATE) 
-                         OVER(PARTITION BY at_physn_npi, desynpuf_id, primary_hcpcs_cd 
-                              ORDER BY clm_from_dt::DATE)) BETWEEN 1 AND 3 
-                   THEN 1 
-                   ELSE 0 
+               CASE
+                   WHEN (clm_from_dt::DATE - LAG(clm_from_dt::DATE)
+                         OVER(PARTITION BY at_physn_npi, desynpuf_id, primary_hcpcs_cd
+                              ORDER BY clm_from_dt::DATE)) BETWEEN 1 AND 3
+                   THEN 1
+                   ELSE 0
                END AS is_near_dup
         FROM base_claims
     ) lag_calc
@@ -206,15 +256,16 @@ prior_year AS (
     GROUP BY at_physn_npi, claim_year
 ),
 
--- 8. Outpatient stats per provider (Standalone CTE)
+-- 8. Outpatient stats per provider (standalone CTE — not filtered through
+--    base_claims because outpatient_claims is a separate table)
 op_stats AS (
-    SELECT at_physn_npi,
-           EXTRACT(YEAR FROM clm_from_dt::DATE)::SMALLINT AS claim_year, -- Cast to DATE
+    SELECT oc.at_physn_npi,
+           EXTRACT(YEAR FROM oc.clm_from_dt::DATE)::SMALLINT AS claim_year,
            COUNT(*)         AS total_outpatient_claims,
-           AVG(clm_pmt_amt) AS avg_outpatient_payment
-    FROM analytics.outpatient_claims
-    WHERE at_physn_npi IS NOT NULL
-    GROUP BY at_physn_npi, EXTRACT(YEAR FROM clm_from_dt::DATE)::SMALLINT -- Cast to DATE
+           AVG(oc.clm_pmt_amt) AS avg_outpatient_payment
+    FROM analytics.outpatient_claims oc
+    WHERE oc.at_physn_npi IN (SELECT at_physn_npi FROM active_npis)
+    GROUP BY oc.at_physn_npi, EXTRACT(YEAR FROM oc.clm_from_dt::DATE)::SMALLINT
 )
 
 -- Final join
@@ -288,37 +339,68 @@ LEFT JOIN op_stats op
 def compute_provider_features(
     db_conn_str: str,
     batch_id: Optional[int] = None,
+    # FIX: these two params scope the query to the current batch window.
+    # batch_start_date: exclusive lower bound (the old watermark date).
+    # batch_end_date:   inclusive upper bound (the new watermark date).
+    # When both are None (e.g. CLI / full-refresh mode) the defaults cover
+    # all dates, replicating the original full-table behaviour intentionally.
+    batch_start_date: Optional[str] = None,
+    batch_end_date: Optional[str] = None,
 ) -> int:
     """
     Runs all feature aggregations inside PostgreSQL.
     Only the final aggregated rows are pulled into Python.
+
+    Args:
+        db_conn_str:      SQLAlchemy connection string for the fraud_claims DB.
+        batch_id:         Batch counter from the DAG run (written to output rows).
+        batch_start_date: Exclusive lower-bound date string ('YYYY-MM-DD').
+                          Only providers with claims AFTER this date are included.
+                          Defaults to '1970-01-01' (full refresh).
+        batch_end_date:   Inclusive upper-bound date string ('YYYY-MM-DD').
+                          Only providers with claims ON OR BEFORE this date are
+                          included. Defaults to '9999-12-31' (full refresh).
     """
     engine = create_engine(db_conn_str)
 
-    # For batch runs, we could add WHERE clauses to restrict to recent data.
-    # Updated to perfectly match the new optimized base_claims CTE
-    where_clause_base = ""
+    # Default to full-refresh window when no date range is supplied.
+    # This preserves backward-compatibility for CLI / manual runs.
+    effective_start = batch_start_date or "1970-01-01"
+    effective_end   = batch_end_date   or "9999-12-31"
 
-    sql = FEATURES_SQL.format(
-        where_clause_base=where_clause_base,
+    log.info(
+        "Computing provider features via SQL aggregation in PostgreSQL "
+        "(batch_start_date=%s, batch_end_date=%s, batch_id=%s)...",
+        effective_start, effective_end, batch_id,
     )
-
-    log.info("Computing provider features via SQL aggregation in PostgreSQL...")
     log.info("(All heavy computation runs inside the database — no large DataFrame loads)")
 
-    df = pd.read_sql(
-        text(sql),
-        engine,
-        params={"batch_id": batch_id or 0},
-    )
+    with engine.connect() as conn:
+        # Give PostgreSQL more sort memory for this session so the
+        # LAG/OVER in near_dups doesn't spill to disk unnecessarily.
+        conn.execute(text(f"SET work_mem = '{WORK_MEM}'"))
+
+        df = pd.read_sql(
+            text(FEATURES_SQL),
+            conn,
+            params={
+                "batch_id":         batch_id or 0,
+                "batch_start_date": effective_start,
+                "batch_end_date":   effective_end,
+            },
+        )
 
     if df.empty:
-        log.warning("Feature query returned no rows. Ensure analytics tables are populated.")
+        log.warning(
+            "Feature query returned no rows for window %s → %s. "
+            "If this is the first run, ensure DAG 1 (historical backfill) has completed.",
+            effective_start, effective_end,
+        )
         return 0
 
     log.info("SQL returned %d provider-year feature rows.", len(df))
 
-    # Upsert: delete existing rows for these providers/years, then insert
+    # Upsert: delete existing rows for these providers/years, then insert.
     npi_list  = df["at_physn_npi"].unique().tolist()
     year_list = [int(y) for y in df["period_year"].unique().tolist()]
 
@@ -351,9 +433,21 @@ def compute_provider_features(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compute provider features via SQL.")
-    parser.add_argument("--batch-id", type=int, default=None)
+    parser.add_argument("--batch-id",         type=int,   default=None)
+    parser.add_argument(
+        "--batch-start-date",
+        type=str, default=None,
+        help="Exclusive lower-bound date (YYYY-MM-DD). Omit for full refresh.",
+    )
+    parser.add_argument(
+        "--batch-end-date",
+        type=str, default=None,
+        help="Inclusive upper-bound date (YYYY-MM-DD). Omit for full refresh.",
+    )
     args = parser.parse_args()
     compute_provider_features(
         db_conn_str=_get_db_conn_str(),
         batch_id=args.batch_id,
+        batch_start_date=args.batch_start_date,
+        batch_end_date=args.batch_end_date,
     )
