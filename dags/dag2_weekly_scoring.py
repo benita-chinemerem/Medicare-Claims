@@ -13,6 +13,13 @@ This DAG is the operational heart of the framework. Each run:
 
 Multi-week Airflow run history from this DAG is the primary evidence of
 continuous, automated monitoring.
+
+FIX (2026-06-30):
+    ingest_batch now pushes batch_start_date (old watermark) and
+    batch_end_date (new watermark) via XCom.  refresh_provider_features
+    pulls those values and forwards them to compute_provider_features so
+    the feature SQL is scoped to the current batch window only.
+    See scripts/etl/feature_engineering.py for the full explanation.
 """
 
 from __future__ import annotations
@@ -56,7 +63,7 @@ CONTAMINATION      = float(os.environ.get("CONTAMINATION_RATE", 0.05))
 
 def create_scoring_run(**context) -> int:
     """
-    Ensures all reporting schemas/tables exist, handles system seeding, 
+    Ensures all reporting schemas/tables exist, handles system seeding,
     and opens or updates a scoring_run log session cleanly.
     """
     from sqlalchemy import create_engine, text
@@ -132,7 +139,7 @@ def create_scoring_run(**context) -> int:
             text("""
                 INSERT INTO scores.scoring_runs (dag_run_id, run_type)
                 VALUES (:dag_run_id, 'weekly')
-                ON CONFLICT (dag_run_id) DO UPDATE 
+                ON CONFLICT (dag_run_id) DO UPDATE
                 SET status = 'running'
                 RETURNING id
             """),
@@ -150,6 +157,10 @@ def ingest_batch(**context):
     Reads the next WEEKLY_BATCH_SIZE carrier claims not yet processed
     (using the scoring_watermark table to track position) and marks them
     as belonging to this scoring run.
+
+    FIX: Now also pushes batch_start_date and batch_end_date via XCom so
+    that refresh_provider_features can scope the feature SQL to this batch
+    window only, instead of scanning the entire carrier_claims table.
     """
     from sqlalchemy import create_engine, text
     import pandas as pd
@@ -162,10 +173,9 @@ def ingest_batch(**context):
             text("SELECT last_clm_date, batch_id FROM analytics.scoring_watermark WHERE claim_type = 'carrier'")
         )
         row = result.fetchone()
-        last_date = row[0]
+        last_date = row[0]   # This is the exclusive lower bound for this batch.
         batch_id  = (row[1] or 0) + 1
 
-        # Fixed: Explicitly CAST clm_from_dt as a DATE to bypass string mismatch errors
         df = pd.read_sql(
             text("""
                 SELECT at_physn_npi, desynpuf_id, clm_from_dt, clm_id,
@@ -184,8 +194,10 @@ def ingest_batch(**context):
 
         if df.empty:
             log.info("No new carrier claims to process in this batch.")
-            context["ti"].xcom_push(key="batch_id", value=batch_id)
+            context["ti"].xcom_push(key="batch_id",      value=batch_id)
             context["ti"].xcom_push(key="carrier_count", value=0)
+            # batch_start/end dates are not pushed on empty batches because
+            # check_batch_has_data will short-circuit before they are needed.
             return
 
         new_watermark = df["clm_from_dt"].max()
@@ -198,9 +210,21 @@ def ingest_batch(**context):
             {"new_date": new_watermark, "bid": batch_id},
         )
 
-    context["ti"].xcom_push(key="batch_id", value=batch_id)
-    context["ti"].xcom_push(key="carrier_count", value=len(df))
-    log.info("Ingested %d carrier claims up to %s (batch %d)", len(df), new_watermark, batch_id)
+    # FIX: Push the date window so refresh_provider_features can scope
+    # the feature SQL to only providers active in this batch.
+    # last_date is the old watermark (exclusive lower bound).
+    # new_watermark is the max clm_from_dt in this batch (inclusive upper bound).
+    # Both are serialised to plain 'YYYY-MM-DD' strings for XCom compatibility.
+    import pandas as pd  # already imported above but kept here for clarity
+    context["ti"].xcom_push(key="batch_id",          value=batch_id)
+    context["ti"].xcom_push(key="carrier_count",     value=len(df))
+    context["ti"].xcom_push(key="batch_start_date",  value=str(last_date))
+    context["ti"].xcom_push(key="batch_end_date",    value=str(pd.Timestamp(new_watermark).date()))
+
+    log.info(
+        "Ingested %d carrier claims from %s to %s (batch %d)",
+        len(df), last_date, new_watermark, batch_id,
+    )
 
 
 def check_batch_has_data(**context) -> bool:
@@ -216,13 +240,32 @@ def refresh_provider_features(**context):
     """
     Calls the feature engineering module to recompute provider-level
     feature vectors for all providers active in the current batch.
+
+    FIX: Passes batch_start_date and batch_end_date (pulled from XCom)
+    into compute_provider_features so the feature SQL only processes
+    the providers that actually have new claims in this batch window,
+    rather than rescanning the entire carrier_claims table on every run.
     """
     import sys
     sys.path.insert(0, "/opt/airflow/scripts")
     from etl.feature_engineering import compute_provider_features
 
-    batch_id = context["ti"].xcom_pull(key="batch_id")
-    compute_provider_features(db_conn_str=DB_CONN_STR, batch_id=batch_id)
+    batch_id         = context["ti"].xcom_pull(key="batch_id")
+    batch_start_date = context["ti"].xcom_pull(key="batch_start_date")
+    batch_end_date   = context["ti"].xcom_pull(key="batch_end_date")
+
+    log.info(
+        "Refreshing provider features for batch %d (window: %s → %s).",
+        batch_id, batch_start_date, batch_end_date,
+    )
+
+    compute_provider_features(
+        db_conn_str=DB_CONN_STR,
+        batch_id=batch_id,
+        batch_start_date=batch_start_date,
+        batch_end_date=batch_end_date,
+    )
+
     log.info("Provider features refreshed for batch %d.", batch_id)
 
 
