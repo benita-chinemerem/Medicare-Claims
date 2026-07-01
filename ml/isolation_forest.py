@@ -190,6 +190,9 @@ def score_providers_batch(
         # Write features to disk for training
         df_all = _load_features(db_conn_str)
         df_all.to_parquet(features_path, index=False)
+        del df_all  # FIX: free 664K-row DataFrame before training starts.
+        # Without this, df_all stays alive in scope for the entire function,
+        # sitting alongside the model bundle + batch df + numpy arrays = OOM.
 
         metrics = train_isolation_forest(
             features_path=features_path,
@@ -216,34 +219,41 @@ def score_providers_batch(
 
     X = df[feat_cols].fillna(0).values
     X_scaled = scaler.transform(X)
+    del X  # FIX: free unscaled array (~96MB) before creating scaled copy
 
     raw_scores  = model.decision_function(X_scaled)
     risk_scores = _normalize_isolation_score(raw_scores)
+    del X_scaled  # FIX: free scaled array (~96MB) — no longer needed
 
     # Compute risk deciles
     deciles = pd.qcut(risk_scores, q=10, labels=False, duplicates="drop") + 1
 
-    # Write results
-    rows_to_insert = []
-    for i, (_, row_) in enumerate(df.iterrows()):
-        is_flagged = int(risk_scores[i]) >= risk_threshold
-        rows_to_insert.append({
-            "at_physn_npi":                    row_["at_physn_npi"],
-            "scoring_run_id":                  scoring_run_id,
-            "period_year":                     row_.get("period_year"),
-            "batch_id":                        batch_id,
-            "isolation_forest_score":          float(raw_scores[i]),
-            "risk_score":                      int(risk_scores[i]),
-            "risk_decile":                     int(deciles[i]) if not np.isnan(deciles[i]) else None,
-            "is_flagged":                      is_flagged,
-            "total_claims":                    row_.get("total_carrier_claims"),
-            "distinct_benes":                  row_.get("distinct_beneficiaries"),
-            "avg_submitted_to_allowed_ratio":  row_.get("avg_submitted_to_allowed_ratio"),
-            "duplicate_rate":                  row_.get("duplicate_rate"),
-            "pct_weekend_claims":              row_.get("pct_weekend_claims"),
-        })
+    # FIX: release model bundle from memory before building the result DataFrame.
+    # The 200-tree IsolationForest can be several hundred MB; freeing it here
+    # gives headroom for the insert_df construction below.
+    del model, scaler, bundle
 
-    insert_df = pd.DataFrame(rows_to_insert)
+    # FIX: build insert_df with vectorised column assignment instead of
+    # df.iterrows() + a list of 664K Python dicts.
+    # iterrows() is the worst pattern for large DataFrames — it creates a
+    # Python dict object per row, blowing up heap usage and taking minutes.
+    # Direct column assignment is O(n) in numpy with no per-row dict overhead.
+    insert_df = pd.DataFrame({
+        "at_physn_npi":                   df["at_physn_npi"].values,
+        "scoring_run_id":                 scoring_run_id,
+        "period_year":                    df["period_year"].values,
+        "batch_id":                       batch_id,
+        "isolation_forest_score":         raw_scores.astype(float),
+        "risk_score":                     risk_scores.astype(int),
+        "risk_decile":                    pd.array(deciles, dtype="Int64"),  # nullable int for NaN safety
+        "is_flagged":                     (risk_scores >= risk_threshold),
+        "total_claims":                   df["total_carrier_claims"].values,
+        "distinct_benes":                 df["distinct_beneficiaries"].values,
+        "avg_submitted_to_allowed_ratio": df["avg_submitted_to_allowed_ratio"].values,
+        "duplicate_rate":                 df["duplicate_rate"].values,
+        "pct_weekend_claims":             df["pct_weekend_claims"].values,
+    })
+
     insert_df.to_sql(
         "provider_risk_scores",
         engine,
@@ -251,6 +261,8 @@ def score_providers_batch(
         if_exists="append",
         index=False,
         method="multi",
+        chunksize=5_000,  # FIX: without chunksize, to_sql builds one SQL
+                          # statement for all 664K rows — another OOM vector.
     )
 
     flagged_count = int(insert_df["is_flagged"].sum())
