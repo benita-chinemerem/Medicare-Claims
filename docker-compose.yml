@@ -125,7 +125,7 @@ services:
   # (metabase-data volume), which is fine for a local/demo environment.
   # ---------------------------------------------------------------------------
   metabase:
-    image: metabase/metabase:v0.50.0
+    image: metabase/metabase:latest
     container_name: fraud_anomaly_metabase
     ports:
       - "3000:3000"
