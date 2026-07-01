@@ -404,7 +404,11 @@ def compute_provider_features(
     npi_list  = df["at_physn_npi"].unique().tolist()
     year_list = [int(y) for y in df["period_year"].unique().tolist()]
 
-    with engine.connect() as conn:
+    # SQLAlchemy 1.4 (Python 3.8 / Airflow): engine.begin() is the correct
+    # way to run DML that needs committing. It auto-commits on clean exit
+    # and rolls back on exception. engine.connect() does NOT expose .commit()
+    # in SQLAlchemy 1.x — that was added in 2.x.
+    with engine.begin() as conn:
         if npi_list and year_list:
             conn.execute(
                 text("""
@@ -414,7 +418,6 @@ def compute_provider_features(
                 """),
                 {"npis": npi_list, "years": year_list},
             )
-        conn.commit()
 
     rows_written = 0
     for i in range(0, len(df), CHUNK_SIZE):
