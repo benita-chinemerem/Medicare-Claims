@@ -34,10 +34,20 @@ log = logging.getLogger(__name__)
 # Feature columns fed to the model.
 # These must exist in features.provider_features.
 # ---------------------------------------------------------------------------
+# FIX 4: has_prior_period added as the 19th feature.
+# claim_volume_growth_pct is NULL (filled 0) for any provider not seen in a
+# prior batch. Without a companion indicator, the model cannot tell a genuine
+# 0% growth provider from a first-time provider. has_prior_period = 1 once
+# at least one prior scoring batch exists for that NPI.
+# NOTE: The existing saved model was trained on 18 features. The next DAG 3
+# retraining run will produce a 19-feature model. Until then, score_providers
+# falls back to the bundle's stored feature list (18 features) automatically
+# via: feat_cols = bundle.get("feature_columns", FEATURE_COLUMNS)
 FEATURE_COLUMNS = [
     "total_carrier_claims",
     "carrier_claims_per_bene",
     "claim_volume_growth_pct",
+    "has_prior_period",
     "distinct_hcpcs_codes",
     "top_hcpcs_code_share",
     "hcpcs_concentration_score",
