@@ -20,7 +20,7 @@ x-airflow-common:
     DATA_PARQUET_PATH: ${DATA_PARQUET_PATH:-/opt/airflow/data/parquet}
     MODEL_PATH: ${MODEL_PATH:-/opt/airflow/models}
     CONTAMINATION_RATE: ${CONTAMINATION_RATE:-0.05}
-    RISK_SCORE_THRESHOLD: ${RISK_SCORE_THRESHOLD:-75}
+    RISK_SCORE_THRESHOLD: ${RISK_SCORE_THRESHOLD:-60}
     WEEKLY_BATCH_SIZE: ${WEEKLY_BATCH_SIZE:-500000}
   volumes:
     - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags

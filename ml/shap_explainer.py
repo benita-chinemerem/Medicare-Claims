@@ -186,50 +186,44 @@ def explain_flagged_providers(
         # Some SHAP versions return a list for multi-output; take index 0
         shap_values = shap_values[0]
 
-    shap_rows   = []
-    update_rows = []
+    # -----------------------------------------------------------------
+    # BUG FIX A — iterrows() replaced with vectorised numpy operations.
+    #
+    # The original code called df.iterrows() over merged (one row per
+    # flagged provider) and built a Python dict per row, per feature.
+    # At 5% contamination on 664K vectors that is ~33K providers × 18
+    # features = ~600K dict objects on the heap before any DB write.
+    #
+    # Fix: all per-feature data is assembled from the existing numpy
+    # arrays (shap_values, X_raw) using np.repeat / np.tile — zero
+    # Python-level iteration over providers for the shap_df build.
+    # Reason-code generation still loops over providers (unavoidable
+    # because _build_reason_text is a Python function) but uses direct
+    # numpy index access rather than iterrows row copies.
+    # -----------------------------------------------------------------
 
-    for i, (_, provider_row) in enumerate(merged.iterrows()):
-        npi          = provider_row["at_physn_npi"]
-        score_row_id = provider_row["score_row_id"]
-        sv           = shap_values[i]
-        fv           = X_raw[i]
+    n_providers, n_features = shap_values.shape
+    abs_shap = np.abs(shap_values)
 
-        # Rank features by |SHAP value|
-        ranked_indices = np.argsort(np.abs(sv))[::-1]
+    # Double-argsort trick: gives the rank (1-based) of each feature
+    # within each provider row by |SHAP value|, fully vectorised.
+    # rank[i, j] == 1 means feature j is the top contributor for provider i.
+    feature_ranks = np.argsort(np.argsort(-abs_shap, axis=1), axis=1) + 1
 
-        # Build per-feature rows for scores.shap_values
-        for rank, idx in enumerate(ranked_indices):
-            feat_name = feat_cols[idx]
-            shap_rows.append({
-                "at_physn_npi":     npi,
-                "scoring_run_id":   scoring_run_id,
-                "feature_name":     feat_name,
-                "shap_value":       float(sv[idx]),
-                "feature_value":    float(fv[idx]),
-                "feature_rank":     rank + 1,
-            })
+    # Build the full shap_values insert DataFrame without any Python loop.
+    npi_values       = merged["at_physn_npi"].values
+    score_row_values = merged["score_row_id"].values
 
-        # Generate top 3 plain-language reason codes
-        reasons = []
-        for idx in ranked_indices[:3]:
-            feat_name = feat_cols[idx]
-            reason    = _build_reason_text(feat_name, float(sv[idx]), float(fv[idx]))
-            reasons.append(reason)
+    shap_df = pd.DataFrame({
+        "at_physn_npi":   np.repeat(npi_values, n_features),
+        "scoring_run_id": scoring_run_id,
+        "feature_name":   np.tile(feat_cols, n_providers),
+        "shap_value":     shap_values.ravel().astype(float),
+        "feature_value":  X_raw.ravel().astype(float),
+        "feature_rank":   feature_ranks.ravel().astype(int),
+    })
 
-        while len(reasons) < 3:
-            reasons.append(None)
-
-        update_rows.append({
-            "score_row_id": int(score_row_id),
-            "top_reason_1": reasons[0],
-            "top_reason_2": reasons[1],
-            "top_reason_3": reasons[2],
-        })
-
-    # Write SHAP value rows
-    if shap_rows:
-        shap_df = pd.DataFrame(shap_rows)
+    if not shap_df.empty:
         shap_df.to_sql(
             "shap_values",
             engine,
@@ -237,11 +231,42 @@ def explain_flagged_providers(
             if_exists="append",
             index=False,
             method="multi",
+            chunksize=5_000,
         )
         log.info("Written %d SHAP value rows for run %d.", len(shap_df), scoring_run_id)
 
-    # Update reason codes in provider_risk_scores
-    with engine.connect() as conn:
+    # Reason codes: top-3 features per provider by |SHAP|.
+    # Loop over providers by index (not iterrows), using numpy arrays directly.
+    top3_indices = np.argsort(-abs_shap, axis=1)[:, :3]  # shape (n_providers, 3)
+
+    update_rows = []
+    for i in range(n_providers):
+        reasons = []
+        for j in range(3):
+            feat_idx  = top3_indices[i, j]
+            feat_name = feat_cols[feat_idx]
+            reason    = _build_reason_text(
+                feat_name,
+                float(shap_values[i, feat_idx]),
+                float(X_raw[i, feat_idx]),
+            )
+            reasons.append(reason)
+
+        update_rows.append({
+            "score_row_id": int(score_row_values[i]),
+            "top_reason_1": reasons[0],
+            "top_reason_2": reasons[1],
+            "top_reason_3": reasons[2],
+        })
+
+    # -----------------------------------------------------------------
+    # BUG FIX B — engine.connect() + conn.commit() crashes on
+    # SQLAlchemy 1.4 (Python 3.8 / Airflow 2.8).
+    # Connection objects in SQLAlchemy 1.x do not expose .commit().
+    # Fix: engine.begin() opens an explicit transaction and auto-commits
+    # on clean exit, auto-rolls back on any exception.
+    # -----------------------------------------------------------------
+    with engine.begin() as conn:
         for update in update_rows:
             conn.execute(
                 text("""
@@ -258,6 +283,6 @@ def explain_flagged_providers(
                     "sid": update["score_row_id"],
                 },
             )
-        conn.commit()
+        # No conn.commit() — engine.begin() handles it automatically.
 
     log.info("Reason codes updated for %d flagged providers.", len(update_rows))
