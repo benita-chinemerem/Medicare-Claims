@@ -310,6 +310,18 @@ SELECT
              / py.prior_period_claim_count * 100
         ELSE NULL
     END                                                AS claim_volume_growth_pct,
+
+    -- FIX 4: has_prior_period tells the model whether claim_volume_growth_pct
+    -- carries real signal (1) or was filled with 0 because no prior batch
+    -- exists yet (0). Without this, the model cannot distinguish a provider
+    -- with genuine 0% growth from a brand-new provider on its first batch,
+    -- causing claim_volume_growth_pct to add noise rather than signal in
+    -- early runs. This feature becomes 1 for all providers once batch 2+
+    -- has been processed and prior_year rows exist in features.provider_features.
+    CASE
+        WHEN COALESCE(py.prior_period_claim_count, 0) > 0 THEN 1
+        ELSE 0
+    END                                                AS has_prior_period,
     COALESCE(op.total_outpatient_claims, 0)            AS total_outpatient_claims,
     COALESCE(op.avg_outpatient_payment, 0)             AS avg_outpatient_payment,
     :batch_id                                          AS batch_id
