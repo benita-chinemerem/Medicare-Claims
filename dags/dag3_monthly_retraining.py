@@ -229,6 +229,47 @@ def log_retraining_summary(**context):
     log.info("Retraining summary logged: %s", summary)
 
 
+
+
+def run_supervised_demo(**context):
+    """
+    Runs the full supervised demonstration pipeline (Section 6.4 of spec):
+      1. Injects synthetic anomalies into a copy of the claims data
+         (upcoding, phantom billing, duplicate submission)
+      2. Recomputes provider features on the injected dataset
+      3. Trains XGBoost binary classifier on the labeled feature vectors
+      4. Evaluates Precision / Recall / F1 per scenario on a held-out test set
+      5. Writes metrics to scores.supervised_model_metrics
+      6. Saves the XGBoost model bundle to MODEL_PATH
+
+    This task runs after log_retraining_summary — it is additive and does
+    NOT affect the active Isolation Forest model or the scoring pipeline.
+    The injected schema (injected.carrier_claims) is created fresh each run
+    and does not modify analytics.carrier_claims.
+    """
+    import sys
+    sys.path.insert(0, "/opt/airflow/scripts")
+    sys.path.insert(0, "/opt/airflow/ml")
+    from etl.inject_anomalies import run_injection
+    from xgboost_classifier import train_xgboost
+
+    log.info("Starting supervised demo: anomaly injection + XGBoost training...")
+    labeled_df = run_injection(db_conn_str=DB_CONN_STR)
+
+    metrics = train_xgboost(
+        labeled_df=labeled_df,
+        model_path=MODEL_PATH,
+        db_conn_str=DB_CONN_STR,
+    )
+
+    context["ti"].xcom_push(key="supervised_metrics", value=str(metrics))
+    for scenario, m in metrics.items():
+        log.info(
+            "Supervised result — %-20s | P=%.4f | R=%.4f | F1=%.4f",
+            scenario, m["precision"], m["recall"], m["f1"],
+        )
+    log.info("Supervised demo complete.")
+
 # ---------------------------------------------------------------------------
 # DAG definition
 # ---------------------------------------------------------------------------
@@ -280,6 +321,17 @@ with DAG(
         trigger_rule="none_failed_min_one_success",
     )
 
+    t_supervised = PythonOperator(
+        task_id="run_supervised_demo",
+        python_callable=run_supervised_demo,
+        execution_timeout=timedelta(hours=2),
+        doc_md=(
+            "Runs the full supervised demonstration: anomaly injection + "
+            "XGBoost training + per-scenario P/R/F1 evaluation. "
+            "Results written to scores.supervised_model_metrics."
+        ),
+    )
+
     end = EmptyOperator(task_id="retraining_complete", trigger_rule="none_failed_min_one_success")
 
     (
@@ -289,5 +341,6 @@ with DAG(
         >> t_evaluate
         >> [t_promote, t_keep]
         >> t_summary
+        >> t_supervised
         >> end
     )

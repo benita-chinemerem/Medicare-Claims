@@ -293,6 +293,35 @@ def score_providers(**context):
     log.info("Scored providers. %d flagged (risk_score >= %d).", flagged_count, RISK_THRESHOLD)
 
 
+def compute_statistical_outliers(**context):
+    """
+    Computes per-feature z-score and IQR outlier flags for all providers
+    in this batch (Section 6.3 of the project spec).
+
+    Runs in parallel with compute_shap_values after score_providers.
+    Results are written to scores.provider_outlier_flags.
+    These single-feature flags act as a sanity check on the composite
+    Isolation Forest score and provide simpler investigator-facing signals.
+    """
+    import sys
+    sys.path.insert(0, "/opt/airflow/ml")
+    from statistical_outliers import score_batch_outliers
+
+    run_id   = context["ti"].xcom_pull(key="scoring_run_id")
+    batch_id = context["ti"].xcom_pull(key="batch_id")
+
+    flag_count = score_batch_outliers(
+        db_conn_str=DB_CONN_STR,
+        scoring_run_id=run_id,
+        batch_id=batch_id,
+    )
+    log.info(
+        "Statistical outlier scoring complete — "
+        "%d (provider, feature) flag rows written for run %d.",
+        flag_count, run_id,
+    )
+
+
 def compute_shap_values(**context):
     """
     Generates SHAP values for all flagged providers in this run.
@@ -428,6 +457,11 @@ with DAG(
         python_callable=score_providers,
     )
 
+    t_outliers = PythonOperator(
+        task_id="compute_statistical_outliers",
+        python_callable=compute_statistical_outliers,
+    )
+
     t_shap = PythonOperator(
         task_id="compute_shap_values",
         python_callable=compute_shap_values,
@@ -441,6 +475,10 @@ with DAG(
 
     end = EmptyOperator(task_id="scoring_complete")
 
+    # score_providers fans out to two parallel tasks:
+    #   compute_statistical_outliers — z-score / IQR flags (Section 6.3)
+    #   compute_shap_values          — SHAP explainability (Section 6.5)
+    # Both must complete before close_scoring_run.
     (
         start
         >> t_create_run
@@ -448,7 +486,7 @@ with DAG(
         >> t_check
         >> t_features
         >> t_score
-        >> t_shap
+        >> [t_outliers, t_shap]
         >> t_close
         >> end
     )
