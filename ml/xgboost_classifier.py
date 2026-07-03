@@ -211,7 +211,7 @@ def train_xgboost(
             "recall":    round(float(r), 4),
             "f1":        round(float(f), 4),
             "auc_roc":   round(auc, 4) if auc is not None else None,
-            "support":   int(sup),
+            "support":   int(sup) if sup is not None else 0,
         }
         log.info(
             "Scenario %-22s | Precision: %.4f | Recall: %.4f | F1: %.4f "
