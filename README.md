@@ -174,8 +174,8 @@ fraud-anomaly-ai/
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/Princeleo400/fraud-anomaly-ai.git
-cd fraud-anomaly-ai
+git clone https://github.com/benita-chinemerem/Medicare-Claims.git
+cd Medicare-Claims
 ```
 
 ### 2. Configure environment variables
